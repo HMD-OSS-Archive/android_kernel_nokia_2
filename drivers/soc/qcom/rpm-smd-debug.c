@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2014, 2017,  The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -26,9 +26,6 @@
 #define MAX_KEY_VALUE_PAIRS 20
 
 static struct dentry *rpm_debugfs_dir;
-static unsigned long magic = 0xdeadbeef;
-static bool rpm_send_msg_enabled;
-static unsigned long rpm_send_msg_usage_count;
 
 static u32 string_to_uint(const u8 *str)
 {
@@ -47,16 +44,10 @@ static ssize_t rsc_ops_write(struct file *fp, const char __user *user_buffer,
 {
 	char buf[MAX_MSG_BUFFER], rsc_type_str[6] = {}, rpm_set[8] = {},
 						key_str[6] = {};
-	int i, pos, set = -1, nelems;
+	int i, pos = -1, set = -1, nelems = -1;
 	char *cmp;
-	uint32_t rsc_type, rsc_id, key, data;
+	uint32_t rsc_type = 0, rsc_id = 0, key = 0, data = 0;
 	struct msm_rpm_request *req;
-
-	rpm_send_msg_usage_count++;
-	if (!rpm_send_msg_enabled) {
-		WARN(1, "rpm_send_msg is not enabled.\n");
-		return count;
-	}
 
 	count = min(count, sizeof(buf) - 1);
 	if (copy_from_user(&buf, user_buffer, count))
@@ -64,8 +55,12 @@ static ssize_t rsc_ops_write(struct file *fp, const char __user *user_buffer,
 	buf[count] = '\0';
 	cmp = strstrip(buf);
 
-	sscanf(cmp, "%7s %5s %u %d %n", rpm_set, rsc_type_str, &rsc_id,
-							&nelems, &pos);
+	if (sscanf(cmp, "%7s %5s %u %d %n", rpm_set, rsc_type_str,
+				&rsc_id, &nelems, &pos) != 4) {
+		pr_err("Invalid number of arguments passed\n");
+		goto err;
+	}
+
 	if (strlen(rpm_set) > 6 || strlen(rsc_type_str) > 4) {
 		pr_err("Invalid value of set or resource type\n");
 		goto err;
@@ -93,19 +88,27 @@ static ssize_t rsc_ops_write(struct file *fp, const char __user *user_buffer,
 
 	for (i = 0; i < nelems; i++) {
 		cmp += pos;
-		sscanf(cmp, "%5s %n", key_str, &pos);
+		if (sscanf(cmp, "%5s %n", key_str, &pos) != 1) {
+			pr_err("Invalid number of arguments passed\n");
+			goto err_request;
+		}
+
 		if (strlen(key_str) > 4) {
 			pr_err("Key value cannot be more than 4 charecters");
-			goto err;
+			goto err_request;
 		}
 		key = string_to_uint(key_str);
 		if (!key) {
 			pr_err("Key values entered incorrectly\n");
-			goto err;
+			goto err_request;
 		}
 
 		cmp += pos;
-		sscanf(cmp, "%u %n", &data, &pos);
+		if (sscanf(cmp, "%u %n", &data, &pos) != 1) {
+			pr_err("Invalid number of arguments passed\n");
+			goto err_request;
+		}
+
 		if (msm_rpm_add_kvp_data(req, key,
 				(void *)&data, sizeof(data)))
 			goto err_request;
@@ -113,6 +116,8 @@ static ssize_t rsc_ops_write(struct file *fp, const char __user *user_buffer,
 
 	if (msm_rpm_wait_for_ack(msm_rpm_send_request(req)))
 		pr_err("Sending the RPM message failed\n");
+	else
+		pr_info("RPM message sent succesfully\n");
 
 err_request:
 	msm_rpm_free_request(req);
@@ -124,35 +129,6 @@ static const struct file_operations rsc_ops = {
 	.write = rsc_ops_write,
 };
 
-/*
- * Once the debug node is enabled, it cannot be disabled.
- * This is useful to find out if anyone ever enables this node,
- * regardless if he/she uses it or not. This debug functionality
- * shouldn't be touched unless one knows exactly what he/she is doing.
- */
-static int rpm_msg_debug_enable_set(void *data, u64 val)
-{
-	if (rpm_send_msg_enabled)
-		return 0;
-
-	if (val != magic) {
-		pr_err("Enable request rejected. Wrong magic.\n");
-		return -EINVAL;
-	}
-	pr_warn("rpm_send_msg is enabled for manual debugging only.\n");
-	rpm_send_msg_enabled = true;
-	return 0;
-}
-
-static int rpm_msg_debug_enable_get(void *data, u64 *val)
-{
-	*val = rpm_send_msg_enabled ? 1 : 0;
-	return 0;
-}
-
-DEFINE_SIMPLE_ATTRIBUTE(rpm_msg_debug_enable_ops, rpm_msg_debug_enable_get,
-			rpm_msg_debug_enable_set, "%lld\n");
-
 static int __init rpm_smd_debugfs_init(void)
 {
 	rpm_debugfs_dir = debugfs_create_dir("rpm_send_msg", NULL);
@@ -161,10 +137,6 @@ static int __init rpm_smd_debugfs_init(void)
 
 	if (!debugfs_create_file("message", S_IWUSR, rpm_debugfs_dir, NULL,
 								&rsc_ops))
-		return -ENOMEM;
-
-	if (!debugfs_create_file("enable", S_IRUSR, rpm_debugfs_dir,
-			&rpm_send_msg_enabled, &rpm_msg_debug_enable_ops))
 		return -ENOMEM;
 
 	return 0;

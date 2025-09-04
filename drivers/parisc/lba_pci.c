@@ -111,8 +111,10 @@ static u32 lba_t32;
 
 
 /* Looks nice and keeps the compiler happy */
-#define LBA_DEV(d) ((struct lba_device *) (d))
-
+#define LBA_DEV(d) ({				\
+	void *__pdata = d;			\
+	BUG_ON(!__pdata);			\
+	(struct lba_device *)__pdata; })
 
 /*
 ** Only allow 8 subsidiary busses per LBA
@@ -1590,7 +1592,6 @@ lba_driver_probe(struct parisc_device *dev)
 		lba_dump_res(&lba_dev->hba.lmmio_space, 2);
 #endif
 	}
-	pci_enable_bridges(lba_bus);
 
 	/*
 	** Once PCI register ops has walked the bus, access to config

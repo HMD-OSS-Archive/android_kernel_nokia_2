@@ -215,8 +215,15 @@ static char *snd_pcm_format_names[] = {
 	FORMAT(G723_40_1B),
 	FORMAT(DSD_U8),
 	FORMAT(DSD_U16_LE),
+	FORMAT(DSD_U32_LE),
+	FORMAT(DSD_U16_BE),
+	FORMAT(DSD_U32_BE),
 };
 
+/**
+ * snd_pcm_format_name - Return a name string for the given PCM format
+ * @format: PCM format
+ */
 const char *snd_pcm_format_name(snd_pcm_format_t format)
 {
 	if ((__force unsigned int)format >= ARRAY_SIZE(snd_pcm_format_names))
@@ -295,7 +302,7 @@ static const char *snd_pcm_state_name(snd_pcm_state_t state)
 	return snd_pcm_state_names[(__force int)state];
 }
 
-#if defined(CONFIG_SND_PCM_OSS) || defined(CONFIG_SND_PCM_OSS_MODULE)
+#if IS_ENABLED(CONFIG_SND_PCM_OSS)
 #include <linux/soundcard.h>
 
 static const char *snd_pcm_oss_format_name(int format)
@@ -338,7 +345,8 @@ static void snd_pcm_proc_info_read(struct snd_pcm_substream *substream,
 
 	info = kmalloc(sizeof(*info), GFP_KERNEL);
 	if (! info) {
-		printk(KERN_DEBUG "snd_pcm_proc_info_read: cannot malloc\n");
+		pcm_dbg(substream->pcm,
+			"snd_pcm_proc_info_read: cannot malloc\n");
 		return;
 	}
 
@@ -398,7 +406,7 @@ static void snd_pcm_substream_proc_hw_params_read(struct snd_info_entry *entry,
 	snd_iprintf(buffer, "rate: %u (%u/%u)\n", runtime->rate, runtime->rate_num, runtime->rate_den);	
 	snd_iprintf(buffer, "period_size: %lu\n", runtime->period_size);	
 	snd_iprintf(buffer, "buffer_size: %lu\n", runtime->buffer_size);	
-#if defined(CONFIG_SND_PCM_OSS) || defined(CONFIG_SND_PCM_OSS_MODULE)
+#if IS_ENABLED(CONFIG_SND_PCM_OSS)
 	if (substream->oss.oss) {
 		snd_iprintf(buffer, "OSS format: %s\n", snd_pcm_oss_format_name(runtime->oss.format));
 		snd_iprintf(buffer, "OSS channels: %u\n", runtime->oss.channels);	
@@ -651,7 +659,7 @@ int snd_pcm_new_stream(struct snd_pcm *pcm, int stream, int substream_count)
 	struct snd_pcm_str *pstr = &pcm->streams[stream];
 	struct snd_pcm_substream *substream, *prev;
 
-#if defined(CONFIG_SND_PCM_OSS) || defined(CONFIG_SND_PCM_OSS_MODULE)
+#if IS_ENABLED(CONFIG_SND_PCM_OSS)
 	mutex_init(&pstr->oss.setup_mutex);
 #endif
 	pstr->stream = stream;
@@ -660,7 +668,7 @@ int snd_pcm_new_stream(struct snd_pcm *pcm, int stream, int substream_count)
 	if (substream_count > 0 && !pcm->internal) {
 		err = snd_pcm_stream_proc_init(pstr);
 		if (err < 0) {
-			snd_printk(KERN_ERR "Error in snd_pcm_stream_proc_init\n");
+			pcm_err(pcm, "Error in snd_pcm_stream_proc_init\n");
 			return err;
 		}
 	}
@@ -668,7 +676,7 @@ int snd_pcm_new_stream(struct snd_pcm *pcm, int stream, int substream_count)
 	for (idx = 0, prev = NULL; idx < substream_count; idx++) {
 		substream = kzalloc(sizeof(*substream), GFP_KERNEL);
 		if (substream == NULL) {
-			snd_printk(KERN_ERR "Cannot allocate PCM substream\n");
+			pcm_err(pcm, "Cannot allocate PCM substream\n");
 			return -ENOMEM;
 		}
 		substream->pcm = pcm;
@@ -685,7 +693,8 @@ int snd_pcm_new_stream(struct snd_pcm *pcm, int stream, int substream_count)
 		if (!pcm->internal) {
 			err = snd_pcm_substream_proc_init(substream);
 			if (err < 0) {
-				snd_printk(KERN_ERR "Error in snd_pcm_stream_proc_init\n");
+				pcm_err(pcm,
+					"Error in snd_pcm_stream_proc_init\n");
 				if (prev == NULL)
 					pstr->substream = NULL;
 				else
@@ -696,6 +705,8 @@ int snd_pcm_new_stream(struct snd_pcm *pcm, int stream, int substream_count)
 		}
 		substream->group = &substream->self_group;
 		spin_lock_init(&substream->self_group.lock);
+		spin_lock_init(&substream->runtime_lock);
+		mutex_init(&substream->self_group.mutex);
 		INIT_LIST_HEAD(&substream->self_group.substreams);
 		list_add_tail(&substream->link_list, &substream->self_group.substreams);
 		atomic_set(&substream->mmap_count, 0);
@@ -703,7 +714,6 @@ int snd_pcm_new_stream(struct snd_pcm *pcm, int stream, int substream_count)
 	}
 	return 0;
 }				
-
 EXPORT_SYMBOL(snd_pcm_new_stream);
 
 static int _snd_pcm_new(struct snd_card *card, const char *id, int device,
@@ -724,7 +734,7 @@ static int _snd_pcm_new(struct snd_card *card, const char *id, int device,
 		*rpcm = NULL;
 	pcm = kzalloc(sizeof(*pcm), GFP_KERNEL);
 	if (pcm == NULL) {
-		snd_printk(KERN_ERR "Cannot allocate PCM\n");
+		dev_err(card->dev, "Cannot allocate PCM\n");
 		return -ENOMEM;
 	}
 	pcm->card = card;
@@ -804,10 +814,26 @@ int snd_pcm_new_internal(struct snd_card *card, const char *id, int device,
 }
 EXPORT_SYMBOL(snd_pcm_new_internal);
 
+static void free_pcm_kctl(struct snd_pcm_str *pstr)
+{
+	if (pstr->chmap_kctl) {
+		snd_ctl_remove(pstr->pcm->card, pstr->chmap_kctl);
+		pstr->chmap_kctl = NULL;
+	}
+	if (pstr->vol_kctl) {
+		snd_ctl_remove(pstr->pcm->card, pstr->vol_kctl);
+		pstr->vol_kctl = NULL;
+	}
+	if (pstr->usr_kctl) {
+		snd_ctl_remove(pstr->pcm->card, pstr->usr_kctl);
+		pstr->usr_kctl = NULL;
+	}
+}
+
 static void snd_pcm_free_stream(struct snd_pcm_str * pstr)
 {
 	struct snd_pcm_substream *substream, *substream_next;
-#if defined(CONFIG_SND_PCM_OSS) || defined(CONFIG_SND_PCM_OSS_MODULE)
+#if IS_ENABLED(CONFIG_SND_PCM_OSS)
 	struct snd_pcm_oss_setup *setup, *setupn;
 #endif
 	substream = pstr->substream;
@@ -819,13 +845,14 @@ static void snd_pcm_free_stream(struct snd_pcm_str * pstr)
 		substream = substream_next;
 	}
 	snd_pcm_stream_proc_done(pstr);
-#if defined(CONFIG_SND_PCM_OSS) || defined(CONFIG_SND_PCM_OSS_MODULE)
+#if IS_ENABLED(CONFIG_SND_PCM_OSS)
 	for (setup = pstr->oss.setup_list; setup; setup = setupn) {
 		setupn = setup->next;
 		kfree(setup->task_name);
 		kfree(setup);
 	}
 #endif
+	free_pcm_kctl(pstr);
 }
 
 static int snd_pcm_free(struct snd_pcm *pcm)
@@ -975,9 +1002,11 @@ int snd_pcm_attach_substream(struct snd_pcm *pcm, int stream,
 void snd_pcm_detach_substream(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime;
+	unsigned long flags = 0;
 
 	if (PCM_RUNTIME_CHECK(substream))
 		return;
+	spin_lock_irqsave(&substream->runtime_lock, flags);
 	runtime = substream->runtime;
 	if (runtime->private_free != NULL)
 		runtime->private_free(runtime);
@@ -994,6 +1023,7 @@ void snd_pcm_detach_substream(struct snd_pcm_substream *substream)
 	put_pid(substream->pid);
 	substream->pid = NULL;
 	substream->pstr->substream_opened--;
+	spin_unlock_irqrestore(&substream->runtime_lock, flags);
 }
 
 static ssize_t show_pcm_class(struct device *dev,
@@ -1016,8 +1046,20 @@ static ssize_t show_pcm_class(struct device *dev,
         return snprintf(buf, PAGE_SIZE, "%s\n", str);
 }
 
-static struct device_attribute pcm_attrs =
-	__ATTR(pcm_class, S_IRUGO, show_pcm_class, NULL);
+static DEVICE_ATTR(pcm_class, S_IRUGO, show_pcm_class, NULL);
+static struct attribute *pcm_dev_attrs[] = {
+	&dev_attr_pcm_class.attr,
+	NULL
+};
+
+static struct attribute_group pcm_dev_attr_group = {
+	.attrs	= pcm_dev_attrs,
+};
+
+static const struct attribute_group *pcm_dev_attr_groups[] = {
+	&pcm_dev_attr_group,
+	NULL
+};
 
 static int snd_pcm_dev_register(struct snd_device *device)
 {
@@ -1067,8 +1109,18 @@ static int snd_pcm_dev_register(struct snd_device *device)
 			mutex_unlock(&register_mutex);
 			return err;
 		}
-		snd_add_device_sysfs_file(devtype, pcm->card, pcm->device,
-					  &pcm_attrs);
+
+		dev = snd_get_device(devtype, pcm->card, pcm->device);
+		if (dev) {
+			err = sysfs_create_groups(&dev->kobj,
+						  pcm_dev_attr_groups);
+			if (err < 0)
+				dev_warn(dev,
+					 "pcm %d:%d: cannot create sysfs groups\n",
+					 pcm->card->number, pcm->device);
+			put_device(dev);
+		}
+
 		for (substream = pcm->streams[cidx].substream; substream; substream = substream->next)
 			snd_pcm_timer_init(substream);
 	}
@@ -1118,18 +1170,7 @@ static int snd_pcm_dev_disconnect(struct snd_device *device)
 			break;
 		}
 		snd_unregister_device(devtype, pcm->card, pcm->device);
-		if (pcm->streams[cidx].chmap_kctl) {
-			snd_ctl_remove(pcm->card, pcm->streams[cidx].chmap_kctl);
-			pcm->streams[cidx].chmap_kctl = NULL;
-		}
-		if (pcm->streams[cidx].vol_kctl) {
-			snd_ctl_remove(pcm->card, pcm->streams[cidx].vol_kctl);
-			pcm->streams[cidx].vol_kctl = NULL;
-		}
-		if (pcm->streams[cidx].usr_kctl) {
-			snd_ctl_remove(pcm->card, pcm->streams[cidx].usr_kctl);
-			pcm->streams[cidx].usr_kctl = NULL;
-		}
+		free_pcm_kctl(&pcm->streams[cidx]);
 	}
 	mutex_unlock(&pcm->open_mutex);
  unlock:
@@ -1137,6 +1178,15 @@ static int snd_pcm_dev_disconnect(struct snd_device *device)
 	return 0;
 }
 
+/**
+ * snd_pcm_notify - Add/remove the notify list
+ * @notify: PCM notify list
+ * @nfree: 0 = register, 1 = unregister
+ *
+ * This adds the given notifier to the global list so that the callback is
+ * called for each registered PCM devices.  This exists only for PCM OSS
+ * emulation, so far.
+ */
 int snd_pcm_notify(struct snd_pcm_notify *notify, int nfree)
 {
 	struct snd_pcm *pcm;
@@ -1159,7 +1209,6 @@ int snd_pcm_notify(struct snd_pcm_notify *notify, int nfree)
 	mutex_unlock(&register_mutex);
 	return 0;
 }
-
 EXPORT_SYMBOL(snd_pcm_notify);
 
 #ifdef CONFIG_PROC_FS

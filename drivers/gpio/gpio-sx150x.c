@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010, 2013, 2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -19,6 +19,7 @@
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <linux/of_gpio.h>
+#include <linux/regulator/consumer.h>
 #include <linux/i2c/sx150x.h>
 #include <linux/of.h>
 #include <linux/delay.h>
@@ -517,7 +518,7 @@ static int sx150x_reset(struct sx150x_chip *chip)
 
 			/* Max. time for NRESET low is 2.5ms */
 			gpio_direction_output(rst_gpio, 0x0);
-			usleep(2500);
+			usleep_range(2450, 2550);
 			gpio_direction_output(rst_gpio, 0x1);
 		}
 	}
@@ -670,9 +671,36 @@ static int sx150x_parse_dt(struct device *dev,
 	}
 	pdata->io_polarity = temp;
 
+	rc = of_property_read_u32(np, "sx150x,gpio_base", &temp);
+	if (rc) {
+		pr_err("%s: Failed to find gpio_base %d\n", __func__, rc);
+		pdata->gpio_base   = -1;
+	}
+	pdata->gpio_base = temp;
+
+
 	/* TODO: Add support for Interrupts */
 	pdata->irq_summary = -1;
-	pdata->gpio_base   = -1;
+	/* Check: pdata->gpio_base   = -1; */
+
+	pdata->vdd_in = devm_regulator_get(dev, "vdd");
+	if (IS_ERR(pdata->vdd_in)) {
+		pr_err("Failed to get regulator: %ld\n",
+			PTR_ERR(pdata->vdd_in));
+		return PTR_ERR(pdata->vdd_in);
+	}
+
+	rc = of_property_read_u32(np, "qcom,vdd-max-voltage", &temp);
+	if (rc)
+		pr_err("%s: No vdd_max voltage entries in dts %d\n",
+				__func__, rc);
+	pdata->vdd_in_maxv = temp;
+
+	rc = of_property_read_u32(np, "qcom,vdd-min-voltage", &temp);
+	if (rc)
+		pr_err("%s: No vdd_min voltage entries in dts %d\n",
+				__func__, rc);
+	pdata->vdd_in_minv = temp;
 
 	return 0;
 }
@@ -696,11 +724,8 @@ static int sx150x_probe(struct i2c_client *client,
 	if (client->dev.of_node) {
 		pdata = devm_kzalloc(&client->dev,
 			sizeof(struct sx150x_platform_data), GFP_KERNEL);
-		if (!pdata) {
-			dev_err(&client->dev, "Failed to allocate memory\n");
+		if (!pdata)
 			return -ENOMEM;
-		}
-
 		rc = sx150x_parse_dt(&client->dev, pdata);
 		if (rc)
 			return rc;
@@ -708,6 +733,25 @@ static int sx150x_probe(struct i2c_client *client,
 		pdata = client->dev.platform_data;
 	if (!pdata)
 		return -EINVAL;
+
+	if (pdata->vdd_in) {
+		if (regulator_count_voltages(pdata->vdd_in) > 0) {
+			rc = regulator_set_voltage(pdata->vdd_in,
+				pdata->vdd_in_minv, pdata->vdd_in_maxv);
+			if (rc) {
+				pr_err("unable to set volt for vdd_in\n");
+				return rc;
+			}
+
+			rc = regulator_enable(pdata->vdd_in);
+			if (rc) {
+				pr_err("unable to enable vdd_in\n");
+				regulator_set_voltage(pdata->vdd_in, 0,
+						pdata->vdd_in_maxv);
+				return rc;
+			}
+		}
+	}
 
 	if (!i2c_check_functionality(client->adapter, i2c_funcs))
 		return -ENOSYS;
@@ -736,8 +780,10 @@ static int sx150x_probe(struct i2c_client *client,
 	i2c_set_clientdata(client, chip);
 
 	return 0;
+
 probe_fail_post_gpiochip_add:
-	WARN_ON(gpiochip_remove(&chip->gpio_chip) < 0);
+	gpiochip_remove(&chip->gpio_chip);
+	/* Check: WARN_ON(gpiochip_remove(&chip->gpio_chip) < 0); */
 probe_fail_pre_gpiochip_add:
 	kfree(chip);
 	return rc;
@@ -746,12 +792,9 @@ probe_fail_pre_gpiochip_add:
 static int sx150x_remove(struct i2c_client *client)
 {
 	struct sx150x_chip *chip;
-	int rc;
 
 	chip = i2c_get_clientdata(client);
-	rc = gpiochip_remove(&chip->gpio_chip);
-	if (rc < 0)
-		return rc;
+	gpiochip_remove(&chip->gpio_chip);
 
 	if (chip->irq_summary >= 0)
 		sx150x_remove_irq_chip(chip);

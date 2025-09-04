@@ -1,4 +1,4 @@
-/*  Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
+/*  Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -26,6 +26,7 @@
 #include "sound/q6afe-v2.h"
 #include <sound/audio_cal_utils.h>
 #include "q6voice.h"
+#include <sound/adsp_err.h>
 
 #define TIMEOUT_MS 300
 
@@ -42,6 +43,13 @@ enum {
 	VOC_SOURCE_TRACKING_MEM_MAP_TOKEN
 };
 
+struct cvd_version_table cvd_version_table_mapping[CVD_INT_VERSION_MAX] = {
+		{CVD_VERSION_DEFAULT, CVD_INT_VERSION_DEFAULT},
+		{CVD_VERSION_0_0, CVD_INT_VERSION_0_0},
+		{CVD_VERSION_2_1, CVD_INT_VERSION_2_1},
+		{CVD_VERSION_2_2, CVD_INT_VERSION_2_2},
+};
+
 static struct common_data common;
 static bool module_initialized;
 
@@ -49,12 +57,12 @@ static int voice_send_enable_vocproc_cmd(struct voice_data *v);
 static int voice_send_netid_timing_cmd(struct voice_data *v);
 static int voice_send_attach_vocproc_cmd(struct voice_data *v);
 static int voice_send_set_device_cmd(struct voice_data *v);
-static int voice_send_disable_vocproc_cmd(struct voice_data *v);
 static int voice_send_vol_step_cmd(struct voice_data *v);
 static int voice_send_mvm_unmap_memory_physical_cmd(struct voice_data *v,
 						    uint32_t mem_handle);
 static int voice_send_mvm_cal_network_cmd(struct voice_data *v);
 static int voice_send_mvm_media_type_cmd(struct voice_data *v);
+static int voice_send_mvm_cvd_version_cmd(struct voice_data *v);
 static int voice_send_cvs_data_exchange_mode_cmd(struct voice_data *v);
 static int voice_send_cvs_packet_exchange_config_cmd(struct voice_data *v);
 static int voice_set_packet_exchange_mode_and_config(uint32_t session_id,
@@ -62,12 +70,15 @@ static int voice_set_packet_exchange_mode_and_config(uint32_t session_id,
 
 static int voice_send_cvs_register_cal_cmd(struct voice_data *v);
 static int voice_send_cvs_deregister_cal_cmd(struct voice_data *v);
+static int voice_send_cvp_create_cmd(struct voice_data *v);
 static int voice_send_cvp_register_dev_cfg_cmd(struct voice_data *v);
 static int voice_send_cvp_deregister_dev_cfg_cmd(struct voice_data *v);
 static int voice_send_cvp_register_cal_cmd(struct voice_data *v);
 static int voice_send_cvp_deregister_cal_cmd(struct voice_data *v);
 static int voice_send_cvp_register_vol_cal_cmd(struct voice_data *v);
 static int voice_send_cvp_deregister_vol_cal_cmd(struct voice_data *v);
+static int voice_send_cvp_device_channels_cmd(struct voice_data *v);
+static int voice_send_cvp_topology_commit_cmd(struct voice_data *v);
 
 static int voice_cvs_stop_playback(struct voice_data *v);
 static int voice_cvs_start_playback(struct voice_data *v);
@@ -81,15 +92,15 @@ static int32_t qdsp_cvp_callback(struct apr_client_data *data, void *priv);
 static int voice_send_set_pp_enable_cmd(struct voice_data *v,
 					uint32_t module_id, int enable);
 static int is_cal_memory_allocated(void);
+static bool is_cvd_version_queried(void);
 static int is_voip_memory_allocated(void);
+static int voice_get_cvd_int_version(char *cvd_ver_string);
 static int voice_alloc_cal_mem_map_table(void);
 static int voice_alloc_rtac_mem_map_table(void);
 static int voice_alloc_oob_shared_mem(void);
 static int voice_free_oob_shared_mem(void);
 static int voice_alloc_oob_mem_table(void);
 static int voice_alloc_and_map_oob_mem(struct voice_data *v);
-static int voice_disable_cvp(uint32_t session_id);
-static int voice_enable_cvp(uint32_t session_id);
 static void voice_vote_powerstate_to_bms(struct voice_data *v, bool state);
 
 static struct voice_data *voice_get_session_by_idx(int idx);
@@ -463,9 +474,6 @@ static void voc_set_error_state(uint16_t reset_proc)
 	int i;
 
 	for (i = 0; i < MAX_VOC_SESSIONS; i++) {
-		if (reset_proc == APR_DEST_MODEM  && i == VOC_PATH_FULL)
-			continue;
-
 		v = &common.voice[i];
 		if (v != NULL)
 			v->voc_state = VOC_ERROR;
@@ -545,9 +553,36 @@ static void init_session_id(void)
 							VOICEMMODE2_VSID;
 }
 
+static bool is_cvd_version_queried(void)
+{
+	bool ret = 0;
+
+	if (!strcmp(common.cvd_version, CVD_VERSION_DEFAULT))
+		ret = false;
+	else
+		ret = true;
+
+	return ret;
+}
+
+static int voice_get_cvd_int_version(char *cvd_ver_string)
+{
+	unsigned int idx;
+	int cvd_int_ver = CVD_INT_VERSION_DEFAULT;
+
+	for (idx = 0; idx < CVD_INT_VERSION_MAX; idx++) {
+		if (strcmp((char *)cvd_ver_string,
+			  cvd_version_table_mapping[idx].cvd_ver) == 0) {
+			cvd_int_ver =
+			cvd_version_table_mapping[idx].cvd_ver_int;
+			break;
+		}
+	}
+	return cvd_int_ver;
+}
+
 static int voice_apr_register(uint32_t session_id)
 {
-	void *modem_mvm, *modem_cvs, *modem_cvp;
 
 	pr_debug("%s\n", __func__);
 
@@ -565,21 +600,6 @@ static int voice_apr_register(uint32_t session_id)
 			pr_err("%s: Unable to register MVM\n", __func__);
 			goto err;
 		}
-
-		/*
-		 * Register with modem for SSR callback for voice, volte and
-		 * modem based QCHAT calls. The APR handle is not stored since
-		 * it is used only to receive notifications and not for
-		 * communication
-		 */
-		if (!is_voip_session(session_id)) {
-			modem_mvm = apr_register("MODEM", "MVM",
-						 qdsp_mvm_callback,
-						 0xFFFFFFFF, &common);
-			if (modem_mvm == NULL)
-				pr_err("%s: Unable to register MVM for MODEM\n",
-					__func__);
-		}
 	}
 
 	if (common.apr_q6_cvs == NULL) {
@@ -594,20 +614,6 @@ static int voice_apr_register(uint32_t session_id)
 			goto err;
 		}
 		rtac_set_voice_handle(RTAC_CVS, common.apr_q6_cvs);
-		/*
-		 * Register with modem for SSR callback for voice, volte and
-		 * modem based QCHAT calls. The APR handle is not stored since
-		 * it is used only to receive notifications and not for
-		 * communication
-		 */
-		if (!is_voip_session(session_id)) {
-			modem_cvs = apr_register("MODEM", "CVS",
-						 qdsp_cvs_callback,
-						 0xFFFFFFFF, &common);
-			 if (modem_cvs == NULL)
-				pr_err("%s: Unable to register CVS for MODEM\n",
-					__func__);
-		}
 	}
 
 	if (common.apr_q6_cvp == NULL) {
@@ -622,20 +628,6 @@ static int voice_apr_register(uint32_t session_id)
 			goto err;
 		}
 		rtac_set_voice_handle(RTAC_CVP, common.apr_q6_cvp);
-		/*
-		 * Register with modem for SSR callback for voice, volte and
-		 * modem based QCHAT calls. The APR handle is not stored since
-		 * it is used only to receive notifications and not for
-		 * communication
-		 */
-		if (!is_voip_session(session_id)) {
-			modem_cvp = apr_register("MODEM", "CVP",
-						 qdsp_cvp_callback,
-						 0xFFFFFFFF, &common);
-			if (modem_cvp == NULL)
-				pr_err("%s: Unable to register CVP for MODEM\n",
-					__func__);
-		}
 	}
 
 	mutex_unlock(&common.common_lock);
@@ -656,6 +648,87 @@ err:
 	mutex_unlock(&common.common_lock);
 
 	return -ENODEV;
+}
+
+static int voice_send_mvm_cvd_version_cmd(struct voice_data *v)
+{
+	int ret;
+	struct apr_hdr cvd_version_get_cmd;
+	void *apr_mvm;
+
+	if (v == NULL) {
+		pr_err("%s: v is NULL\n", __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+
+	apr_mvm = common.apr_q6_mvm;
+	if (!apr_mvm) {
+		pr_err("%s: apr_mvm is NULL.\n", __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+
+	/* Send command to CVD to retrieve Version */
+	cvd_version_get_cmd.hdr_field = APR_HDR_FIELD(
+				APR_MSG_TYPE_SEQ_CMD,
+				APR_HDR_LEN(APR_HDR_SIZE),
+				APR_PKT_VER);
+	cvd_version_get_cmd.pkt_size = APR_PKT_SIZE(
+				APR_HDR_SIZE,
+				sizeof(cvd_version_get_cmd) -
+				APR_HDR_SIZE);
+	cvd_version_get_cmd.src_port =
+		voice_get_idx_for_session(v->session_id);
+	cvd_version_get_cmd.dest_port = 0;
+	cvd_version_get_cmd.token = 0;
+	cvd_version_get_cmd.opcode = VSS_IVERSION_CMD_GET;
+
+	pr_debug("%s: send CVD version get cmd, pkt size = %d\n",
+		 __func__, cvd_version_get_cmd.pkt_size);
+
+	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
+	ret = apr_send_pkt(apr_mvm,
+			   (uint32_t *) &cvd_version_get_cmd);
+	if (ret < 0) {
+		pr_err("%s: Error sending command\n", __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+
+	ret = wait_event_timeout(v->mvm_wait,
+			(v->mvm_state == CMD_STATUS_SUCCESS),
+			msecs_to_jiffies(TIMEOUT_MS));
+	if (!ret) {
+		pr_err("%s: wait_event timeout, fall back to default\n",
+		       __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+			__func__, adsp_err_get_err_str(
+			v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+			v->async_err);
+		goto done;
+	}
+	ret = 0;
+
+done:
+	if (ret) {
+		strlcpy(common.cvd_version, CVD_VERSION_0_0,
+				sizeof(common.cvd_version));
+	}
+	pr_debug("%s: CVD Version retrieved=%s\n",
+		 __func__, common.cvd_version);
+
+	return ret;
 }
 
 static int voice_send_dual_control_cmd(struct voice_data *v)
@@ -695,6 +768,7 @@ static int voice_send_dual_control_cmd(struct voice_data *v)
 					VSS_IMVM_CMD_SET_POLICY_DUAL_CONTROL;
 		mvm_voice_ctl_cmd.voice_ctl.enable_flag = true;
 		v->mvm_state = CMD_STATUS_FAIL;
+		v->async_err = 0;
 
 		ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_voice_ctl_cmd);
 		if (ret < 0) {
@@ -709,6 +783,14 @@ static int voice_send_dual_control_cmd(struct voice_data *v)
 		if (!ret) {
 			pr_err("%s: wait_event timeout\n", __func__);
 			ret = -EINVAL;
+			goto fail;
+		}
+		if (v->async_err > 0) {
+			pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+			ret = adsp_err_get_lnx_err_code(
+					v->async_err);
 			goto fail;
 		}
 	}
@@ -799,6 +881,7 @@ static int voice_create_mvm_cvs_session(struct voice_data *v)
 			}
 
 			v->mvm_state = CMD_STATUS_FAIL;
+			v->async_err = 0;
 
 			ret = apr_send_pkt(apr_mvm,
 					(uint32_t *) &mvm_session_cmd);
@@ -812,6 +895,14 @@ static int voice_create_mvm_cvs_session(struct voice_data *v)
 					msecs_to_jiffies(TIMEOUT_MS));
 			if (!ret) {
 				pr_err("%s: wait_event timeout\n", __func__);
+				goto fail;
+			}
+			if (v->async_err > 0) {
+				pr_err("%s: DSP returned error[%s]\n",
+					__func__, adsp_err_get_err_str(
+					v->async_err));
+				ret = adsp_err_get_lnx_err_code(
+						v->async_err);
 				goto fail;
 			}
 		} else {
@@ -834,6 +925,7 @@ static int voice_create_mvm_cvs_session(struct voice_data *v)
 				strlen("default voip")+1);
 
 			v->mvm_state = CMD_STATUS_FAIL;
+			v->async_err = 0;
 
 			ret = apr_send_pkt(apr_mvm,
 					(uint32_t *) &mvm_session_cmd);
@@ -846,6 +938,14 @@ static int voice_create_mvm_cvs_session(struct voice_data *v)
 					 msecs_to_jiffies(TIMEOUT_MS));
 			if (!ret) {
 				pr_err("%s: wait_event timeout\n", __func__);
+				goto fail;
+			}
+			if (v->async_err > 0) {
+				pr_err("%s: DSP returned error[%s]\n",
+					__func__, adsp_err_get_err_str(
+					v->async_err));
+				ret = adsp_err_get_lnx_err_code(
+						v->async_err);
 				goto fail;
 			}
 		}
@@ -904,6 +1004,7 @@ static int voice_create_mvm_cvs_session(struct voice_data *v)
 				strlen("default modem voice")+1);
 			}
 			v->cvs_state = CMD_STATUS_FAIL;
+			v->async_err = 0;
 
 			ret = apr_send_pkt(apr_cvs,
 					(uint32_t *) &cvs_session_cmd);
@@ -916,6 +1017,14 @@ static int voice_create_mvm_cvs_session(struct voice_data *v)
 					 msecs_to_jiffies(TIMEOUT_MS));
 			if (!ret) {
 				pr_err("%s: wait_event timeout\n", __func__);
+				goto fail;
+			}
+			if (v->async_err > 0) {
+				pr_err("%s: DSP returned error[%s]\n",
+					__func__, adsp_err_get_err_str(
+					v->async_err));
+				ret = adsp_err_get_lnx_err_code(
+						v->async_err);
 				goto fail;
 			}
 			/* Get the created CVS handle. */
@@ -952,6 +1061,7 @@ static int voice_create_mvm_cvs_session(struct voice_data *v)
 				strlen("default q6 voice")+1);
 
 			v->cvs_state = CMD_STATUS_FAIL;
+			v->async_err = 0;
 
 			ret = apr_send_pkt(apr_cvs,
 					   (uint32_t *) &cvs_full_ctl_cmd);
@@ -966,6 +1076,14 @@ static int voice_create_mvm_cvs_session(struct voice_data *v)
 					msecs_to_jiffies(TIMEOUT_MS));
 			if (!ret) {
 				pr_err("%s: wait_event timeout\n", __func__);
+				goto fail;
+			}
+			if (v->async_err > 0) {
+				pr_err("%s: DSP returned error[%s]\n",
+					__func__, adsp_err_get_err_str(
+					v->async_err));
+				ret = adsp_err_get_lnx_err_code(
+						v->async_err);
 				goto fail;
 			}
 			/* Get the created CVS handle. */
@@ -991,6 +1109,7 @@ static int voice_create_mvm_cvs_session(struct voice_data *v)
 			attach_stream_cmd.attach_stream.handle = cvs_handle;
 
 			v->mvm_state = CMD_STATUS_FAIL;
+			v->async_err = 0;
 			ret = apr_send_pkt(apr_mvm,
 					   (uint32_t *) &attach_stream_cmd);
 			if (ret < 0) {
@@ -1005,12 +1124,20 @@ static int voice_create_mvm_cvs_session(struct voice_data *v)
 				pr_err("%s: wait_event timeout\n", __func__);
 				goto fail;
 			}
+			if (v->async_err > 0) {
+				pr_err("%s: DSP returned error[%s]\n",
+					__func__, adsp_err_get_err_str(
+					v->async_err));
+				ret = adsp_err_get_lnx_err_code(
+						v->async_err);
+				goto fail;
+			}
 		}
 	}
 	return 0;
 
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_unmap_cal_block(struct voice_data *v, int cal_index)
@@ -1101,6 +1228,7 @@ static int voice_destroy_mvm_cvs_session(struct voice_data *v)
 		detach_stream.detach_stream.handle = cvs_handle;
 
 		v->mvm_state = CMD_STATUS_FAIL;
+		v->async_err = 0;
 		ret = apr_send_pkt(apr_mvm, (uint32_t *) &detach_stream);
 		if (ret < 0) {
 			pr_err("%s: Error %d sending DETACH_STREAM\n",
@@ -1114,6 +1242,14 @@ static int voice_destroy_mvm_cvs_session(struct voice_data *v)
 		if (!ret) {
 			pr_err("%s: wait event timeout\n", __func__);
 
+			goto fail;
+		}
+		if (v->async_err > 0) {
+			pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+			ret = adsp_err_get_lnx_err_code(
+					v->async_err);
 			goto fail;
 		}
 
@@ -1154,6 +1290,7 @@ static int voice_destroy_mvm_cvs_session(struct voice_data *v)
 		cvs_destroy.opcode = APRV2_IBASIC_CMD_DESTROY_SESSION;
 
 		v->cvs_state = CMD_STATUS_FAIL;
+		v->async_err = 0;
 		ret = apr_send_pkt(apr_cvs, (uint32_t *) &cvs_destroy);
 		if (ret < 0) {
 			pr_err("%s: Error %d sending CVS DESTROY\n",
@@ -1167,6 +1304,14 @@ static int voice_destroy_mvm_cvs_session(struct voice_data *v)
 		if (!ret) {
 			pr_err("%s: wait event timeout\n", __func__);
 
+			goto fail;
+		}
+		if (v->async_err > 0) {
+			pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+			ret = adsp_err_get_lnx_err_code(
+					v->async_err);
 			goto fail;
 		}
 		cvs_handle = 0;
@@ -1203,6 +1348,7 @@ static int voice_destroy_mvm_cvs_session(struct voice_data *v)
 		mvm_destroy.opcode = APRV2_IBASIC_CMD_DESTROY_SESSION;
 
 		v->mvm_state = CMD_STATUS_FAIL;
+		v->async_err = 0;
 
 		ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_destroy);
 		if (ret < 0) {
@@ -1218,12 +1364,20 @@ static int voice_destroy_mvm_cvs_session(struct voice_data *v)
 			pr_err("%s: wait event timeout\n", __func__);
 			goto fail;
 		}
+		if (v->async_err > 0) {
+			pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+			ret = adsp_err_get_lnx_err_code(
+					v->async_err);
+			goto fail;
+		}
 		mvm_handle = 0;
 		voice_set_mvm_handle(v, mvm_handle);
 	}
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_tty_mode_cmd(struct voice_data *v)
@@ -1264,6 +1418,7 @@ static int voice_send_tty_mode_cmd(struct voice_data *v)
 	pr_debug("tty mode =%d\n", mvm_tty_mode_cmd.tty_mode.mode);
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_tty_mode_cmd);
 	if (ret < 0) {
 		pr_err("%s: Error %d sending SET_TTY_MODE\n",
@@ -1277,9 +1432,17 @@ static int voice_send_tty_mode_cmd(struct voice_data *v)
 		pr_err("%s: wait_event timeout\n", __func__);
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_set_pp_enable_cmd(struct voice_data *v,
@@ -1323,6 +1486,7 @@ static int voice_send_set_pp_enable_cmd(struct voice_data *v,
 		module_id, enable);
 
 	v->cvs_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_cvs, (uint32_t *) &cvs_set_pp_cmd);
 	if (ret < 0) {
 		pr_err("Fail: sending cvs set pp enable,\n");
@@ -1335,9 +1499,17 @@ static int voice_send_set_pp_enable_cmd(struct voice_data *v,
 		pr_err("%s: wait_event timeout\n", __func__);
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_hd_cmd(struct voice_data *v, int enable)
@@ -1388,6 +1560,7 @@ static int voice_send_hd_cmd(struct voice_data *v, int enable)
 	pr_debug("%s: enable=%d\n", __func__, enable);
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_set_hd_cmd);
 	if (ret < 0) {
 		pr_err("%s: Failed to sending mvm set HD Voice enable %d\n",
@@ -1404,6 +1577,14 @@ static int voice_send_hd_cmd(struct voice_data *v, int enable)
 		pr_err("%s: wait_event timeout\n", __func__);
 
 		ret = -EINVAL;
+		goto done;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto done;
 	}
 
@@ -1447,6 +1628,7 @@ static int voice_set_dtx(struct voice_data *v)
 	pr_debug("%s: Setting DTX %d\n", __func__, common.mvs_info.dtx_mode);
 
 	v->cvs_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 
 	ret = apr_send_pkt(apr_cvs, (uint32_t *) &cvs_set_dtx);
 	if (ret < 0) {
@@ -1460,6 +1642,14 @@ static int voice_set_dtx(struct voice_data *v)
 	if (!ret) {
 		pr_err("%s: wait_event timeout\n", __func__);
 		return -EINVAL;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		return ret;
 	}
 
 	return 0;
@@ -1501,6 +1691,7 @@ static int voice_send_mvm_media_type_cmd(struct voice_data *v)
 		 __func__ , mvm_set_cal_media_type.media_id);
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_set_cal_media_type);
 	if (ret < 0) {
 		pr_err("%s: Error %d sending media type\n", __func__, ret);
@@ -1514,9 +1705,17 @@ static int voice_send_mvm_media_type_cmd(struct voice_data *v)
 		pr_err("%s: wait_event timeout %d\n", __func__, ret);
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_dtmf_rx_detection_cmd(struct voice_data *v,
@@ -1557,6 +1756,7 @@ static int voice_send_dtmf_rx_detection_cmd(struct voice_data *v,
 	cvs_dtmf_rx_detection.cvs_dtmf_det.enable = enable;
 
 	v->cvs_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 
 	ret = apr_send_pkt(apr_cvs, (uint32_t *) &cvs_dtmf_rx_detection);
 	if (ret < 0) {
@@ -1573,6 +1773,14 @@ static int voice_send_dtmf_rx_detection_cmd(struct voice_data *v,
 	if (!ret) {
 		pr_err("%s: wait_event timeout\n", __func__);
 		return -EINVAL;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		return ret;
 	}
 
 	return ret;
@@ -1836,6 +2044,7 @@ static int voice_config_cvs_vocoder_amr_rate(struct voice_data *v)
 	cvs_set_amr_rate.amr_rate.mode = common.mvs_info.rate;
 
 	v->cvs_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 
 	ret = apr_send_pkt(apr_cvs, (uint32_t *) &cvs_set_amr_rate);
 	if (ret < 0) {
@@ -1851,6 +2060,14 @@ static int voice_config_cvs_vocoder_amr_rate(struct voice_data *v)
 		pr_err("%s: wait_event timeout\n", __func__);
 
 		ret = -EINVAL;
+		goto done;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto done;
 	}
 
@@ -1895,6 +2112,7 @@ static int voice_config_cvs_vocoder(struct voice_data *v)
 	cvs_set_media_cmd.media_type.rx_media_id = common.mvs_info.media_type;
 
 	v->cvs_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 
 	ret = apr_send_pkt(apr_cvs, (uint32_t *) &cvs_set_media_cmd);
 	if (ret < 0) {
@@ -1909,6 +2127,14 @@ static int voice_config_cvs_vocoder(struct voice_data *v)
 	if (!ret) {
 		pr_err("%s: wait_event timeout\n", __func__);
 
+		goto fail;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto fail;
 	}
 	/* Set encoder properties. */
@@ -1939,6 +2165,7 @@ static int voice_config_cvs_vocoder(struct voice_data *v)
 				common.mvs_info.evrc_max_rate;
 
 		v->cvs_state = CMD_STATUS_FAIL;
+		v->async_err = 0;
 
 		ret = apr_send_pkt(apr_cvs, (uint32_t *) &cvs_set_cdma_rate);
 		if (ret < 0) {
@@ -1952,6 +2179,14 @@ static int voice_config_cvs_vocoder(struct voice_data *v)
 		if (!ret) {
 			pr_err("%s: wait_event timeout\n", __func__);
 
+			goto fail;
+		}
+		if (v->async_err > 0) {
+			pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+			ret = adsp_err_get_lnx_err_code(
+					v->async_err);
 			goto fail;
 		}
 
@@ -1993,7 +2228,7 @@ static int voice_config_cvs_vocoder(struct voice_data *v)
 	return 0;
 
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 int voc_update_amr_vocoder_rate(uint32_t session_id)
@@ -2054,6 +2289,7 @@ static int voice_send_start_voice_cmd(struct voice_data *v)
 	mvm_start_voice_cmd.opcode = VSS_IMVM_CMD_START_VOICE;
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_start_voice_cmd);
 	if (ret < 0) {
 		pr_err("Fail in sending VSS_IMVM_CMD_START_VOICE\n");
@@ -2071,61 +2307,17 @@ static int voice_send_start_voice_cmd(struct voice_data *v)
 			voice_vote_powerstate_to_bms(v, true);
 		}
 	}
-	return 0;
-fail:
-	return -EINVAL;
-}
-
-static int voice_send_disable_vocproc_cmd(struct voice_data *v)
-{
-	struct apr_hdr cvp_disable_cmd;
-	int ret = 0;
-	void *apr_cvp;
-	u16 cvp_handle;
-
-	if (v == NULL) {
-		pr_err("%s: v is NULL\n", __func__);
-		return -EINVAL;
-	}
-	apr_cvp = common.apr_q6_cvp;
-
-	if (!apr_cvp) {
-		pr_err("%s: apr regist failed\n", __func__);
-		return -EINVAL;
-	}
-	cvp_handle = voice_get_cvp_handle(v);
-
-	/* disable vocproc and wait for respose */
-	cvp_disable_cmd.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
-						APR_HDR_LEN(APR_HDR_SIZE),
-						APR_PKT_VER);
-	cvp_disable_cmd.pkt_size = APR_PKT_SIZE(APR_HDR_SIZE,
-				sizeof(cvp_disable_cmd) - APR_HDR_SIZE);
-	pr_debug("cvp_disable_cmd pkt size = %d, cvp_handle=%d\n",
-		cvp_disable_cmd.pkt_size, cvp_handle);
-	cvp_disable_cmd.src_port =
-				voice_get_idx_for_session(v->session_id);
-	cvp_disable_cmd.dest_port = cvp_handle;
-	cvp_disable_cmd.token = 0;
-	cvp_disable_cmd.opcode = VSS_IVOCPROC_CMD_DISABLE;
-
-	v->cvp_state = CMD_STATUS_FAIL;
-	ret = apr_send_pkt(apr_cvp, (uint32_t *) &cvp_disable_cmd);
-	if (ret < 0) {
-		pr_err("Fail in sending VSS_IVOCPROC_CMD_DISABLE\n");
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto fail;
 	}
-	ret = wait_event_timeout(v->cvp_wait,
-			(v->cvp_state == CMD_STATUS_SUCCESS),
-			msecs_to_jiffies(TIMEOUT_MS));
-	if (!ret) {
-		pr_err("%s: wait_event timeout\n", __func__);
-		goto fail;
-	}
-
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static void voc_get_tx_rx_topology(struct voice_data *v,
@@ -2181,7 +2373,14 @@ static int voice_send_set_device_cmd(struct voice_data *v)
 				voice_get_idx_for_session(v->session_id);
 	cvp_setdev_cmd.hdr.dest_port = cvp_handle;
 	cvp_setdev_cmd.hdr.token = 0;
-	cvp_setdev_cmd.hdr.opcode = VSS_IVOCPROC_CMD_SET_DEVICE_V2;
+
+	if (voice_get_cvd_int_version(common.cvd_version) >=
+	    CVD_INT_VERSION_2_2)
+		cvp_setdev_cmd.hdr.opcode =
+				VSS_IVOCPROC_CMD_SET_DEVICE_V3;
+	else
+		cvp_setdev_cmd.hdr.opcode =
+				VSS_IVOCPROC_CMD_SET_DEVICE_V2;
 
 	voc_get_tx_rx_topology(v,
 			&cvp_setdev_cmd.cvp_set_device_v2.tx_topology_id,
@@ -2207,12 +2406,13 @@ static int voice_send_set_device_cmd(struct voice_data *v)
 		cvp_setdev_cmd.cvp_set_device_v2.rx_port_id);
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_cvp, (uint32_t *) &cvp_setdev_cmd);
 	if (ret < 0) {
-		pr_err("Fail in sending VOCPROC_FULL_CONTROL_SESSION\n");
+		pr_err("Fail in sending VSS_IVOCPROC_CMD_SET_DEVICE\n");
 		goto fail;
 	}
-	pr_debug("wait for cvp create session event\n");
+
 	ret = wait_event_timeout(v->cvp_wait,
 			(v->cvp_state == CMD_STATUS_SUCCESS),
 			msecs_to_jiffies(TIMEOUT_MS));
@@ -2220,10 +2420,18 @@ static int voice_send_set_device_cmd(struct voice_data *v)
 		pr_err("%s: wait_event timeout\n", __func__);
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_stop_voice_cmd(struct voice_data *v)
@@ -2259,6 +2467,7 @@ static int voice_send_stop_voice_cmd(struct voice_data *v)
 	mvm_stop_voice_cmd.opcode = VSS_IMVM_CMD_STOP_VOICE;
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_stop_voice_cmd);
 	if (ret < 0) {
 		pr_err("Fail in sending VSS_IMVM_CMD_STOP_VOICE\n");
@@ -2271,10 +2480,18 @@ static int voice_send_stop_voice_cmd(struct voice_data *v)
 		pr_err("%s: wait_event timeout\n", __func__);
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 static int voice_get_cal(struct cal_block_data **cal_block,
 			 int cal_block_idx,
@@ -2373,12 +2590,15 @@ static int voice_send_cvs_register_cal_cmd(struct voice_data *v)
 
 	cvs_reg_cal_cmd.cvs_cal_data.cal_mem_handle =
 		cal_block->map_data.q6map_handle;
-	cvs_reg_cal_cmd.cvs_cal_data.cal_mem_address =
-		cal_block->cal_data.paddr;
+	cvs_reg_cal_cmd.cvs_cal_data.cal_mem_address_lsw =
+		lower_32_bits(cal_block->cal_data.paddr);
+	cvs_reg_cal_cmd.cvs_cal_data.cal_mem_address_msw =
+		msm_audio_populate_upper_32_bits(cal_block->cal_data.paddr);
 	cvs_reg_cal_cmd.cvs_cal_data.cal_mem_size =
 		cal_block->cal_data.size;
 
 	v->cvs_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(common.apr_q6_cvs, (uint32_t *) &cvs_reg_cal_cmd);
 	if (ret < 0) {
 		pr_err("%s: Error %d registering CVS cal\n", __func__, ret);
@@ -2393,6 +2613,14 @@ static int voice_send_cvs_register_cal_cmd(struct voice_data *v)
 		pr_err("%s: Command timeout\n", __func__);
 
 		ret = -EINVAL;
+		goto unlock;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto unlock;
 	}
 unlock:
@@ -2438,6 +2666,7 @@ static int voice_send_cvs_deregister_cal_cmd(struct voice_data *v)
 			VSS_ISTREAM_CMD_DEREGISTER_CALIBRATION_DATA;
 
 	v->cvs_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(common.apr_q6_cvs, (uint32_t *) &cvs_dereg_cal_cmd);
 	if (ret < 0) {
 		pr_err("%s: Error %d de-registering CVS cal\n", __func__, ret);
@@ -2450,10 +2679,122 @@ static int voice_send_cvs_deregister_cal_cmd(struct voice_data *v)
 		pr_err("%s: Command  timeout\n", __func__);
 		goto done;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto done;
+	}
 
 done:
 	return ret;
 
+}
+
+static int voice_send_cvp_create_cmd(struct voice_data *v)
+{
+	struct cvp_create_full_ctl_session_cmd cvp_session_cmd;
+	void *apr_cvp;
+	int ret = 0;
+
+	if (v == NULL) {
+		pr_err("%s: v is NULL\n", __func__);
+		ret = -EINVAL;
+		goto done;
+	}
+
+	apr_cvp = common.apr_q6_cvp;
+	if (!apr_cvp) {
+		pr_err("%s: apr_cvp is NULL.\n", __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+
+	/* create cvp session and wait for response */
+	cvp_session_cmd.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
+						APR_HDR_LEN(APR_HDR_SIZE),
+						APR_PKT_VER);
+	cvp_session_cmd.hdr.pkt_size = APR_PKT_SIZE(APR_HDR_SIZE,
+				sizeof(cvp_session_cmd) - APR_HDR_SIZE);
+	pr_debug("%s: send create cvp session, pkt size = %d\n",
+		 __func__, cvp_session_cmd.hdr.pkt_size);
+	cvp_session_cmd.hdr.src_port =
+				voice_get_idx_for_session(v->session_id);
+	cvp_session_cmd.hdr.dest_port = 0;
+	cvp_session_cmd.hdr.token = 0;
+
+	if (voice_get_cvd_int_version(common.cvd_version) >=
+	    CVD_INT_VERSION_2_2)
+		cvp_session_cmd.hdr.opcode =
+				VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V3;
+	else
+		cvp_session_cmd.hdr.opcode =
+				VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2;
+
+	voc_get_tx_rx_topology(v,
+			&cvp_session_cmd.cvp_session.tx_topology_id,
+			&cvp_session_cmd.cvp_session.rx_topology_id);
+
+	cvp_session_cmd.cvp_session.direction = 2; /*tx and rx*/
+	cvp_session_cmd.cvp_session.tx_port_id = v->dev_tx.port_id;
+	cvp_session_cmd.cvp_session.rx_port_id = v->dev_rx.port_id;
+	cvp_session_cmd.cvp_session.profile_id =
+					 VSS_ICOMMON_CAL_NETWORK_ID_NONE;
+	if (common.ec_ref_ext) {
+		cvp_session_cmd.cvp_session.vocproc_mode =
+				VSS_IVOCPROC_VOCPROC_MODE_EC_EXT_MIXING;
+		cvp_session_cmd.cvp_session.ec_ref_port_id =
+					common.ec_port_id;
+	} else {
+		cvp_session_cmd.cvp_session.vocproc_mode =
+				 VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING;
+		cvp_session_cmd.cvp_session.ec_ref_port_id =
+						 VSS_IVOCPROC_PORT_ID_NONE;
+	}
+
+	pr_debug("tx_topology: %d tx_port_id=%d, rx_port_id=%d, mode: 0x%x\n",
+		cvp_session_cmd.cvp_session.tx_topology_id,
+		cvp_session_cmd.cvp_session.tx_port_id,
+		cvp_session_cmd.cvp_session.rx_port_id,
+		cvp_session_cmd.cvp_session.vocproc_mode);
+	pr_debug("rx_topology: %d, profile_id: 0x%x, pkt_size: %d\n",
+		cvp_session_cmd.cvp_session.rx_topology_id,
+		cvp_session_cmd.cvp_session.profile_id,
+		cvp_session_cmd.hdr.pkt_size);
+
+	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
+	ret = apr_send_pkt(apr_cvp, (uint32_t *) &cvp_session_cmd);
+	if (ret < 0) {
+		pr_err("Fail in sending VOCPROC_FULL_CONTROL_SESSION\n");
+
+		ret = -EINVAL;
+		goto done;
+	}
+
+	ret = wait_event_timeout(v->cvp_wait,
+				 (v->cvp_state == CMD_STATUS_SUCCESS),
+				 msecs_to_jiffies(TIMEOUT_MS));
+	if (!ret) {
+		pr_err("%s: wait_event timeout\n", __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+			__func__, adsp_err_get_err_str(
+			v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto done;
+	}
+
+done:
+	return ret;
 }
 
 static int voice_send_cvp_register_dev_cfg_cmd(struct voice_data *v)
@@ -2501,12 +2842,15 @@ static int voice_send_cvp_register_dev_cfg_cmd(struct voice_data *v)
 
 	cvp_reg_dev_cfg_cmd.cvp_dev_cfg_data.mem_handle =
 		cal_block->map_data.q6map_handle;
-	cvp_reg_dev_cfg_cmd.cvp_dev_cfg_data.mem_address =
-		cal_block->cal_data.paddr;
+	cvp_reg_dev_cfg_cmd.cvp_dev_cfg_data.mem_address_lsw =
+		lower_32_bits(cal_block->cal_data.paddr);
+	cvp_reg_dev_cfg_cmd.cvp_dev_cfg_data.mem_address_msw =
+		msm_audio_populate_upper_32_bits(cal_block->cal_data.paddr);
 	cvp_reg_dev_cfg_cmd.cvp_dev_cfg_data.mem_size =
 		cal_block->cal_data.size;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(common.apr_q6_cvp,
 			   (uint32_t *) &cvp_reg_dev_cfg_cmd);
 	if (ret < 0) {
@@ -2523,6 +2867,14 @@ static int voice_send_cvp_register_dev_cfg_cmd(struct voice_data *v)
 		pr_err("%s: Command timeout\n", __func__);
 
 		ret = -EINVAL;
+		goto unlock;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto unlock;
 	}
 unlock:
@@ -2564,6 +2916,7 @@ static int voice_send_cvp_deregister_dev_cfg_cmd(struct voice_data *v)
 				VSS_IVOCPROC_CMD_DEREGISTER_DEVICE_CONFIG;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(common.apr_q6_cvp,
 			   (uint32_t *) &cvp_dereg_dev_cfg_cmd);
 	if (ret < 0) {
@@ -2576,6 +2929,14 @@ static int voice_send_cvp_deregister_dev_cfg_cmd(struct voice_data *v)
 				 msecs_to_jiffies(TIMEOUT_MS));
 	if (!ret) {
 		pr_err("%s: Command timeout\n", __func__);
+		goto done;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto done;
 	}
 
@@ -2617,6 +2978,14 @@ static int voice_send_cvp_register_cal_cmd(struct voice_data *v)
 		goto unlock;
 	}
 
+	v->dev_tx.dev_id = ((struct audio_cal_info_vocproc *)
+				cal_block->cal_info)->tx_acdb_id;
+	v->dev_rx.dev_id = ((struct audio_cal_info_vocproc *)
+				cal_block->cal_info)->rx_acdb_id;
+	pr_debug("%s: %s: Tx acdb id = %d and Rx acdb id = %d", __func__,
+		 voc_get_session_name(v->session_id), v->dev_tx.dev_id,
+		 v->dev_rx.dev_id);
+
 	memcpy(&cvp_reg_cal_cmd.cvp_cal_data.column_info[0],
 	       (void *) &((struct audio_cal_info_voc_col *)
 	       col_data->cal_info)->data,
@@ -2639,12 +3008,15 @@ static int voice_send_cvp_register_cal_cmd(struct voice_data *v)
 
 	cvp_reg_cal_cmd.cvp_cal_data.cal_mem_handle =
 		cal_block->map_data.q6map_handle;
-	cvp_reg_cal_cmd.cvp_cal_data.cal_mem_address =
-		cal_block->cal_data.paddr;
+	cvp_reg_cal_cmd.cvp_cal_data.cal_mem_address_lsw =
+		lower_32_bits(cal_block->cal_data.paddr);
+	cvp_reg_cal_cmd.cvp_cal_data.cal_mem_address_msw =
+		msm_audio_populate_upper_32_bits(cal_block->cal_data.paddr);
 	cvp_reg_cal_cmd.cvp_cal_data.cal_mem_size =
 		cal_block->cal_data.size;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(common.apr_q6_cvp, (uint32_t *) &cvp_reg_cal_cmd);
 	if (ret < 0) {
 		pr_err("%s: Error %d registering CVP cal\n", __func__, ret);
@@ -2659,6 +3031,14 @@ static int voice_send_cvp_register_cal_cmd(struct voice_data *v)
 		pr_err("%s: Command timeout\n", __func__);
 
 		ret = -EINVAL;
+		goto unlock;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto unlock;
 	}
 unlock:
@@ -2704,6 +3084,7 @@ static int voice_send_cvp_deregister_cal_cmd(struct voice_data *v)
 			VSS_IVOCPROC_CMD_DEREGISTER_CALIBRATION_DATA;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(common.apr_q6_cvp, (uint32_t *) &cvp_dereg_cal_cmd);
 	if (ret < 0) {
 		pr_err("%s: Error %d de-registering CVP cal\n", __func__, ret);
@@ -2716,9 +3097,17 @@ static int voice_send_cvp_deregister_cal_cmd(struct voice_data *v)
 		pr_err("%s: Command timeout\n", __func__);
 		goto done;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto done;
+	}
 
 done:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_cvp_register_vol_cal_cmd(struct voice_data *v)
@@ -2777,12 +3166,15 @@ static int voice_send_cvp_register_vol_cal_cmd(struct voice_data *v)
 
 	cvp_reg_vol_cal_cmd.cvp_vol_cal_data.cal_mem_handle =
 		cal_block->map_data.q6map_handle;
-	cvp_reg_vol_cal_cmd.cvp_vol_cal_data.cal_mem_address =
-		cal_block->cal_data.paddr;
+	cvp_reg_vol_cal_cmd.cvp_vol_cal_data.cal_mem_address_lsw =
+		lower_32_bits(cal_block->cal_data.paddr);
+	cvp_reg_vol_cal_cmd.cvp_vol_cal_data.cal_mem_address_msw =
+		msm_audio_populate_upper_32_bits(cal_block->cal_data.paddr);
 	cvp_reg_vol_cal_cmd.cvp_vol_cal_data.cal_mem_size =
 		cal_block->cal_data.size;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(common.apr_q6_cvp,
 			   (uint32_t *) &cvp_reg_vol_cal_cmd);
 	if (ret < 0) {
@@ -2798,6 +3190,14 @@ static int voice_send_cvp_register_vol_cal_cmd(struct voice_data *v)
 		pr_err("%s: Command timeout\n", __func__);
 
 		ret = -EINVAL;
+		goto unlock;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto unlock;
 	}
 unlock:
@@ -2844,6 +3244,7 @@ static int voice_send_cvp_deregister_vol_cal_cmd(struct voice_data *v)
 			VSS_IVOCPROC_CMD_DEREGISTER_VOL_CALIBRATION_DATA;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(common.apr_q6_cvp,
 			   (uint32_t *) &cvp_dereg_vol_cal_cmd);
 	if (ret < 0) {
@@ -2856,6 +3257,14 @@ static int voice_send_cvp_deregister_vol_cal_cmd(struct voice_data *v)
 				 msecs_to_jiffies(TIMEOUT_MS));
 	if (!ret) {
 		pr_err("%s: Command timeout\n", __func__);
+		goto done;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto done;
 	}
 
@@ -2875,19 +3284,19 @@ static int voice_map_memory_physical_cmd(struct voice_data *v,
 
 	if (v == NULL) {
 		pr_err("%s: v is NULL\n", __func__);
-
+		ret = -EINVAL;
 		goto fail;
 	}
 
 	if (!common.apr_q6_mvm) {
 		pr_err("%s: apr_mvm is NULL.\n", __func__);
-
+		ret = -EINVAL;
 		goto fail;
 	}
 
 	if (!table_info->data) {
 		pr_err("%s: memory table is NULL.\n", __func__);
-
+		ret = -EINVAL;
 		goto fail;
 	}
 
@@ -2903,9 +3312,9 @@ static int voice_map_memory_physical_cmd(struct voice_data *v,
 	/* Store next table descriptor's size */
 	memtable[2] = 0;
 
-	/* Store shared mem add */
-	memtable[3] = phys;
-	memtable[4] = 0;
+	/* Store shared mem adddress (64 bit) */
+	memtable[3] = lower_32_bits(phys);
+	memtable[4] = msm_audio_populate_upper_32_bits(phys);
 
 	/* Store shared memory size */
 	memtable[5] = size;
@@ -2920,7 +3329,10 @@ static int voice_map_memory_physical_cmd(struct voice_data *v,
 	mvm_map_phys_cmd.hdr.token = token;
 	mvm_map_phys_cmd.hdr.opcode = VSS_IMEMORY_CMD_MAP_PHYSICAL;
 
-	mvm_map_phys_cmd.table_descriptor.mem_address = table_info->phys;
+	mvm_map_phys_cmd.table_descriptor.mem_address_lsw =
+			lower_32_bits(table_info->phys);
+	mvm_map_phys_cmd.table_descriptor.mem_address_msw =
+			msm_audio_populate_upper_32_bits(table_info->phys);
 	mvm_map_phys_cmd.table_descriptor.mem_size =
 			sizeof(struct vss_imemory_block_t) +
 			sizeof(struct vss_imemory_table_descriptor_t);
@@ -2934,11 +3346,12 @@ static int voice_map_memory_physical_cmd(struct voice_data *v,
 	pr_debug("%s: next table desc: add: %lld, size: %d\n",
 		 __func__, *((uint64_t *) memtable),
 		 *(((uint32_t *) memtable) + 2));
-	pr_debug("%s: phy add of of mem being mapped 0x%x, size: %d\n",
+	pr_debug("%s: phy add of of mem being mapped LSW:0x%x, MSW:0x%x size: %d\n",
 		 __func__, *(((uint32_t *) memtable) + 3),
-		 *(((uint32_t *) memtable) + 5));
+		*(((uint32_t *) memtable) + 4), *(((uint32_t *) memtable) + 5));
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(common.apr_q6_mvm, (uint32_t *) &mvm_map_phys_cmd);
 	if (ret < 0) {
 		pr_err("%s: Error %d sending mvm map phy cmd\n", __func__, ret);
@@ -2954,11 +3367,19 @@ static int voice_map_memory_physical_cmd(struct voice_data *v,
 
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 
 	return 0;
 
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_pause_voice_call(struct voice_data *v)
@@ -2996,6 +3417,7 @@ static int voice_pause_voice_call(struct voice_data *v)
 	mvm_pause_voice_cmd.token = 0;
 	mvm_pause_voice_cmd.opcode = VSS_IMVM_CMD_PAUSE_VOICE;
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 
 	pr_debug("%s: send mvm_pause_voice_cmd pkt size = %d\n",
 		__func__, mvm_pause_voice_cmd.pkt_size);
@@ -3016,6 +3438,14 @@ static int voice_pause_voice_call(struct voice_data *v)
 		pr_err("%s: Command timeout\n", __func__);
 
 		ret = -EINVAL;
+		goto done;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto done;
 	}
 
@@ -3088,6 +3518,13 @@ static int remap_cal_data(struct cal_block_data *cal_block,
 {
 	int ret = 0;
 	pr_debug("%s\n", __func__);
+
+	if (cal_block->map_data.ion_client == NULL) {
+		pr_err("%s: No ION allocation for session_id %d!\n",
+			__func__, session_id);
+		ret = -EINVAL;
+		goto done;
+	}
 
 	if ((cal_block->map_data.map_size > 0) &&
 		(cal_block->map_data.q6map_handle == 0)) {
@@ -3376,77 +3813,25 @@ done:
 
 static int voice_setup_vocproc(struct voice_data *v)
 {
-	struct cvp_create_full_ctl_session_cmd cvp_session_cmd;
 	int ret = 0;
-	void *apr_cvp;
-	if (v == NULL) {
-		pr_err("%s: v is NULL\n", __func__);
-		return -EINVAL;
-	}
-	apr_cvp = common.apr_q6_cvp;
 
-	if (!apr_cvp) {
-		pr_err("%s: apr_cvp is NULL.\n", __func__);
-		return -EINVAL;
-	}
-
-	/* create cvp session and wait for response */
-	cvp_session_cmd.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
-						APR_HDR_LEN(APR_HDR_SIZE),
-						APR_PKT_VER);
-	cvp_session_cmd.hdr.pkt_size = APR_PKT_SIZE(APR_HDR_SIZE,
-				sizeof(cvp_session_cmd) - APR_HDR_SIZE);
-	pr_debug(" send create cvp session, pkt size = %d\n",
-		cvp_session_cmd.hdr.pkt_size);
-	cvp_session_cmd.hdr.src_port =
-				voice_get_idx_for_session(v->session_id);
-	cvp_session_cmd.hdr.dest_port = 0;
-	cvp_session_cmd.hdr.token = 0;
-	cvp_session_cmd.hdr.opcode =
-			VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2;
-
-	voc_get_tx_rx_topology(v,
-			&cvp_session_cmd.cvp_session.tx_topology_id,
-			&cvp_session_cmd.cvp_session.rx_topology_id);
-
-	cvp_session_cmd.cvp_session.direction = 2; /*tx and rx*/
-	cvp_session_cmd.cvp_session.tx_port_id = v->dev_tx.port_id;
-	cvp_session_cmd.cvp_session.rx_port_id = v->dev_rx.port_id;
-	cvp_session_cmd.cvp_session.profile_id =
-					 VSS_ICOMMON_CAL_NETWORK_ID_NONE;
-	if (common.ec_ref_ext) {
-		cvp_session_cmd.cvp_session.vocproc_mode =
-				VSS_IVOCPROC_VOCPROC_MODE_EC_EXT_MIXING;
-		cvp_session_cmd.cvp_session.ec_ref_port_id =
-					common.ec_port_id;
-	} else {
-		cvp_session_cmd.cvp_session.vocproc_mode =
-				 VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING;
-		cvp_session_cmd.cvp_session.ec_ref_port_id =
-						 VSS_IVOCPROC_PORT_ID_NONE;
-	}
-
-	pr_debug("tx_topology: %d tx_port_id=%d, rx_port_id=%d, mode: 0x%x\n",
-		cvp_session_cmd.cvp_session.tx_topology_id,
-		cvp_session_cmd.cvp_session.tx_port_id,
-		cvp_session_cmd.cvp_session.rx_port_id,
-		cvp_session_cmd.cvp_session.vocproc_mode);
-	pr_debug("rx_topology: %d, profile_id: 0x%x, pkt_size: %d\n",
-		cvp_session_cmd.cvp_session.rx_topology_id,
-		cvp_session_cmd.cvp_session.profile_id,
-		cvp_session_cmd.hdr.pkt_size);
-
-	v->cvp_state = CMD_STATUS_FAIL;
-	ret = apr_send_pkt(apr_cvp, (uint32_t *) &cvp_session_cmd);
+	ret = voice_send_cvp_create_cmd(v);
 	if (ret < 0) {
-		pr_err("Fail in sending VOCPROC_FULL_CONTROL_SESSION\n");
+		pr_err("%s: CVP create failed err:%d\n", __func__, ret);
 		goto fail;
 	}
-	ret = wait_event_timeout(v->cvp_wait,
-				 (v->cvp_state == CMD_STATUS_SUCCESS),
-				 msecs_to_jiffies(TIMEOUT_MS));
-	if (!ret) {
-		pr_err("%s: wait_event timeout\n", __func__);
+
+	ret = voice_send_cvp_device_channels_cmd(v);
+	if (ret < 0) {
+		pr_err("%s: Set device channels failed err:%d\n",
+		       __func__, ret);
+		goto fail;
+	}
+
+	ret = voice_send_cvp_topology_commit_cmd(v);
+	if (ret < 0) {
+		pr_err("%s: Set topology commit failed err:%d\n",
+		       __func__, ret);
 		goto fail;
 	}
 
@@ -3503,12 +3888,168 @@ static int voice_setup_vocproc(struct voice_data *v)
 	rtac_add_voice(voice_get_cvs_handle(v),
 		voice_get_cvp_handle(v),
 		v->dev_rx.port_id, v->dev_tx.port_id,
+		v->dev_rx.dev_id, v->dev_tx.dev_id,
 		v->session_id);
 
 	return 0;
 
 fail:
-	return -EINVAL;
+	return ret;
+}
+
+static int voice_send_cvp_device_channels_cmd(struct voice_data *v)
+{
+	int ret = 0;
+	struct  cvp_set_dev_channels_cmd cvp_set_dev_channels_cmd;
+	void *apr_cvp;
+	u16 cvp_handle;
+
+	if (!(voice_get_cvd_int_version(common.cvd_version) >=
+	      CVD_INT_VERSION_2_2)) {
+		pr_debug("%s CVD ver %s doesnt support send_device_channels cmd\n",
+			 __func__, common.cvd_version);
+
+		goto done;
+	}
+
+	if (v == NULL) {
+		pr_err("%s: v is NULL\n", __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+
+	apr_cvp = common.apr_q6_cvp;
+	if (!apr_cvp) {
+		pr_err("%s: apr_cvp is NULL.\n", __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+
+	cvp_handle = voice_get_cvp_handle(v);
+	cvp_set_dev_channels_cmd.hdr.hdr_field =
+			APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
+			APR_HDR_LEN(APR_HDR_SIZE),
+			APR_PKT_VER);
+	cvp_set_dev_channels_cmd.hdr.pkt_size = APR_PKT_SIZE(APR_HDR_SIZE,
+			sizeof(cvp_set_dev_channels_cmd) - APR_HDR_SIZE);
+	cvp_set_dev_channels_cmd.hdr.src_port =
+				voice_get_idx_for_session(v->session_id);
+	cvp_set_dev_channels_cmd.hdr.dest_port = cvp_handle;
+	cvp_set_dev_channels_cmd.hdr.token = 0;
+	cvp_set_dev_channels_cmd.hdr.opcode =
+				VSS_IVOCPROC_CMD_TOPOLOGY_SET_DEV_CHANNELS;
+	cvp_set_dev_channels_cmd.cvp_set_channels.rx_num_channels =
+				VSS_NUM_DEV_CHANNELS_1;
+	cvp_set_dev_channels_cmd.cvp_set_channels.tx_num_channels =
+				v->dev_tx.no_of_channels;
+
+	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
+	ret = apr_send_pkt(apr_cvp, (uint32_t *) &cvp_set_dev_channels_cmd);
+	if (ret < 0) {
+		pr_err("%s: Fail in sending VSS_IVOCPROC_CMD_TOPOLOGY_SET_DEV_CHANNELS\n",
+		       __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+
+	ret = wait_event_timeout(v->cvp_wait,
+				(v->cvp_state == CMD_STATUS_SUCCESS),
+				msecs_to_jiffies(TIMEOUT_MS));
+	if (!ret) {
+		pr_err("%s: wait_event timeout\n", __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+			__func__, adsp_err_get_err_str(
+			v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto done;
+	}
+
+done:
+	return ret;
+}
+
+static int voice_send_cvp_topology_commit_cmd(struct voice_data *v)
+{
+	int ret = 0;
+	struct apr_hdr cvp_topology_commit_cmd;
+	void *apr_cvp;
+	u16 cvp_handle;
+
+	if (!(voice_get_cvd_int_version(common.cvd_version) >=
+	      CVD_INT_VERSION_2_2)) {
+		pr_debug("%s CVD version string %s doesnt support this command\n",
+			 __func__, common.cvd_version);
+
+		goto done;
+	}
+
+	if (v == NULL) {
+		pr_err("%s: v is NULL\n", __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+
+	apr_cvp = common.apr_q6_cvp;
+	if (!apr_cvp) {
+		pr_err("%s: apr_cvp is NULL.\n", __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+
+	cvp_handle = voice_get_cvp_handle(v);
+	cvp_topology_commit_cmd.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
+						APR_HDR_LEN(APR_HDR_SIZE),
+						APR_PKT_VER);
+	cvp_topology_commit_cmd.pkt_size = APR_PKT_SIZE(APR_HDR_SIZE,
+				sizeof(cvp_topology_commit_cmd) - APR_HDR_SIZE);
+	cvp_topology_commit_cmd.src_port =
+				voice_get_idx_for_session(v->session_id);
+	cvp_topology_commit_cmd.dest_port = cvp_handle;
+	cvp_topology_commit_cmd.token = 0;
+	cvp_topology_commit_cmd.opcode = VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT;
+
+	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
+	ret = apr_send_pkt(apr_cvp, (uint32_t *) &cvp_topology_commit_cmd);
+	if (ret < 0) {
+		pr_err("%s: Fail in sending VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT\n",
+		       __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+
+	ret = wait_event_timeout(v->cvp_wait,
+				(v->cvp_state == CMD_STATUS_SUCCESS),
+				msecs_to_jiffies(TIMEOUT_MS));
+	if (!ret) {
+		pr_err("%s: wait_event timeout\n", __func__);
+		ret = -EINVAL;
+		goto done;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+			__func__, adsp_err_get_err_str(
+			v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto done;
+	}
+
+done:
+	return ret;
 }
 
 static int voice_send_enable_vocproc_cmd(struct voice_data *v)
@@ -3545,6 +4086,7 @@ static int voice_send_enable_vocproc_cmd(struct voice_data *v)
 	cvp_enable_cmd.opcode = VSS_IVOCPROC_CMD_ENABLE;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_cvp, (uint32_t *) &cvp_enable_cmd);
 	if (ret < 0) {
 		pr_err("Fail in sending VSS_IVOCPROC_CMD_ENABLE\n");
@@ -3557,10 +4099,18 @@ static int voice_send_enable_vocproc_cmd(struct voice_data *v)
 		pr_err("%s: wait_event timeout\n", __func__);
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_mvm_cal_network_cmd(struct voice_data *v)
@@ -3595,6 +4145,7 @@ static int voice_send_mvm_cal_network_cmd(struct voice_data *v)
 	mvm_set_cal_network.network_id = VSS_ICOMMON_CAL_NETWORK_ID_NONE;
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_set_cal_network);
 	if (ret < 0) {
 		pr_err("%s: Error %d sending SET_NETWORK\n", __func__, ret);
@@ -3608,9 +4159,17 @@ static int voice_send_mvm_cal_network_cmd(struct voice_data *v)
 		pr_err("%s: wait_event timeout %d\n", __func__, ret);
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_netid_timing_cmd(struct voice_data *v)
@@ -3640,7 +4199,7 @@ static int voice_send_netid_timing_cmd(struct voice_data *v)
 		goto fail;
 	}
 	/* Set network ID. */
-	pr_debug("Setting network ID\n");
+	pr_debug("Setting network ID %x\n", common.mvs_info.network_type);
 
 	mvm_set_network.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
 						APR_HDR_LEN(APR_HDR_SIZE),
@@ -3651,10 +4210,11 @@ static int voice_send_netid_timing_cmd(struct voice_data *v)
 				voice_get_idx_for_session(v->session_id);
 	mvm_set_network.hdr.dest_port = mvm_handle;
 	mvm_set_network.hdr.token = 0;
-	mvm_set_network.hdr.opcode = VSS_ICOMMON_CMD_SET_NETWORK;
+	mvm_set_network.hdr.opcode = VSS_IMVM_CMD_SET_CAL_NETWORK;
 	mvm_set_network.network.network_id = common.mvs_info.network_type;
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_set_network);
 	if (ret < 0) {
 		pr_err("%s: Error %d sending SET_NETWORK\n", __func__, ret);
@@ -3666,6 +4226,14 @@ static int voice_send_netid_timing_cmd(struct voice_data *v)
 				 msecs_to_jiffies(TIMEOUT_MS));
 	if (!ret) {
 		pr_err("%s: wait_event timeout\n", __func__);
+		goto fail;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto fail;
 	}
 
@@ -3689,6 +4257,7 @@ static int voice_send_netid_timing_cmd(struct voice_data *v)
 	mvm_set_voice_timing.timing.dec_offset = 8300;
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 
 	ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_set_voice_timing);
 	if (ret < 0) {
@@ -3703,10 +4272,18 @@ static int voice_send_netid_timing_cmd(struct voice_data *v)
 		pr_err("%s: wait_event timeout\n", __func__);
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_attach_vocproc_cmd(struct voice_data *v)
@@ -3745,6 +4322,7 @@ static int voice_send_attach_vocproc_cmd(struct voice_data *v)
 	mvm_a_vocproc_cmd.mvm_attach_cvp_handle.handle = cvp_handle;
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_a_vocproc_cmd);
 	if (ret < 0) {
 		pr_err("Fail in sending VSS_IMVM_CMD_ATTACH_VOCPROC\n");
@@ -3757,10 +4335,18 @@ static int voice_send_attach_vocproc_cmd(struct voice_data *v)
 		pr_err("%s: wait_event timeout\n", __func__);
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static void voc_update_session_params(struct voice_data *v)
@@ -3852,6 +4438,7 @@ static int voice_destroy_vocproc(struct voice_data *v)
 	mvm_d_vocproc_cmd.mvm_detach_cvp_handle.handle = cvp_handle;
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_mvm, (uint32_t *) &mvm_d_vocproc_cmd);
 	if (ret < 0) {
 		pr_err("Fail in sending VSS_IMVM_CMD_DETACH_VOCPROC\n");
@@ -3862,6 +4449,14 @@ static int voice_destroy_vocproc(struct voice_data *v)
 				 msecs_to_jiffies(TIMEOUT_MS));
 	if (!ret) {
 		pr_err("%s: wait_event timeout\n", __func__);
+		goto fail;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto fail;
 	}
 
@@ -3885,6 +4480,7 @@ static int voice_destroy_vocproc(struct voice_data *v)
 	cvp_destroy_session_cmd.opcode = APRV2_IBASIC_CMD_DESTROY_SESSION;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_cvp, (uint32_t *) &cvp_destroy_session_cmd);
 	if (ret < 0) {
 		pr_err("Fail in sending APRV2_IBASIC_CMD_DESTROY_SESSION\n");
@@ -3897,13 +4493,21 @@ static int voice_destroy_vocproc(struct voice_data *v)
 		pr_err("%s: wait_event timeout\n", __func__);
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 
 	rtac_remove_voice(voice_get_cvs_handle(v));
 	cvp_handle = 0;
 	voice_set_cvp_handle(v, cvp_handle);
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_mvm_unmap_memory_physical_cmd(struct voice_data *v,
@@ -3941,6 +4545,7 @@ static int voice_send_mvm_unmap_memory_physical_cmd(struct voice_data *v,
 	pr_debug("%s: mem_handle: 0x%x\n", __func__, mem_unmap.mem_handle);
 
 	v->mvm_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_mvm, (uint32_t *) &mem_unmap);
 	if (ret < 0) {
 		pr_err("mem_unmap op[0x%x]ret[%d]\n",
@@ -3955,6 +4560,14 @@ static int voice_send_mvm_unmap_memory_physical_cmd(struct voice_data *v,
 		pr_err("%s: wait_event timeout %d\n", __func__, ret);
 		goto fail;
 	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 	return 0;
 
 fail:
@@ -3966,8 +4579,6 @@ static int voice_send_cvs_packet_exchange_config_cmd(struct voice_data *v)
 	struct vss_istream_cmd_set_oob_packet_exchange_config_t
 						 packet_exchange_config_pkt;
 	int ret = 0;
-	phys_addr_t dec_buf;
-	phys_addr_t enc_buf;
 	void *apr_cvs;
 	u16 cvs_handle;
 
@@ -3975,8 +4586,6 @@ static int voice_send_cvs_packet_exchange_config_cmd(struct voice_data *v)
 		pr_err("%s: v is NULL\n", __func__);
 		return -EINVAL;
 	}
-	dec_buf = (phys_addr_t)v->shmem_info.sh_buf.buf[0].phys;
-	enc_buf = (phys_addr_t)v->shmem_info.sh_buf.buf[1].phys;
 
 	apr_cvs = common.apr_q6_cvs;
 
@@ -4000,19 +4609,32 @@ static int voice_send_cvs_packet_exchange_config_cmd(struct voice_data *v)
 	packet_exchange_config_pkt.hdr.opcode =
 			 VSS_ISTREAM_CMD_SET_OOB_PACKET_EXCHANGE_CONFIG;
 	packet_exchange_config_pkt.mem_handle = v->shmem_info.mem_handle;
-	packet_exchange_config_pkt.dec_buf_addr = (uint32_t)dec_buf;
+	/* dec buffer address */
+	packet_exchange_config_pkt.dec_buf_addr_lsw =
+		lower_32_bits(v->shmem_info.sh_buf.buf[0].phys);
+	packet_exchange_config_pkt.dec_buf_addr_msw =
+		msm_audio_populate_upper_32_bits(
+					v->shmem_info.sh_buf.buf[0].phys);
 	packet_exchange_config_pkt.dec_buf_size = 4096;
-	packet_exchange_config_pkt.enc_buf_addr = (uint32_t)enc_buf;
+	/* enc buffer address */
+	packet_exchange_config_pkt.enc_buf_addr_lsw =
+		lower_32_bits(v->shmem_info.sh_buf.buf[1].phys);
+	packet_exchange_config_pkt.enc_buf_addr_msw =
+		msm_audio_populate_upper_32_bits(
+					v->shmem_info.sh_buf.buf[1].phys);
 	packet_exchange_config_pkt.enc_buf_size = 4096;
 
-	pr_debug("%s: dec buf: add %pK, size %d, enc buf: add %pK, size %d\n",
+	pr_debug("%s: dec buf add: lsw %0x msw %0x, size %d, enc buf add: lsw %0x msw %0x, size %d\n",
 		__func__,
-		&dec_buf,
+		packet_exchange_config_pkt.dec_buf_addr_lsw,
+		packet_exchange_config_pkt.dec_buf_addr_msw,
 		packet_exchange_config_pkt.dec_buf_size,
-		&enc_buf,
+		packet_exchange_config_pkt.enc_buf_addr_lsw,
+		packet_exchange_config_pkt.enc_buf_addr_msw,
 		packet_exchange_config_pkt.enc_buf_size);
 
 	v->cvs_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_cvs, (uint32_t *) &packet_exchange_config_pkt);
 	if (ret < 0) {
 		pr_err("Failed to send packet exchange config cmd %d\n", ret);
@@ -4025,9 +4647,18 @@ static int voice_send_cvs_packet_exchange_config_cmd(struct voice_data *v)
 	if (!ret)
 		pr_err("%s: wait_event timeout %d\n", __func__, ret);
 
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
+
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_cvs_data_exchange_mode_cmd(struct voice_data *v)
@@ -4062,6 +4693,7 @@ static int voice_send_cvs_data_exchange_mode_cmd(struct voice_data *v)
 	data_exchange_pkt.mode = VSS_ISTREAM_PACKET_EXCHANGE_MODE_OUT_OF_BAND;
 
 	v->cvs_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_cvs, (uint32_t *) &data_exchange_pkt);
 	if (ret < 0) {
 		pr_err("Failed to send data exchange mode %d\n", ret);
@@ -4074,9 +4706,17 @@ static int voice_send_cvs_data_exchange_mode_cmd(struct voice_data *v)
 	if (!ret)
 		pr_err("%s: wait_event timeout %d\n", __func__, ret);
 
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		goto fail;
+	}
 	return 0;
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_stream_mute_cmd(struct voice_data *v, uint16_t direction,
@@ -4087,13 +4727,13 @@ static int voice_send_stream_mute_cmd(struct voice_data *v, uint16_t direction,
 
 	if (v == NULL) {
 		pr_err("%s: v is NULL\n", __func__);
-
+		ret = -EINVAL;
 		goto fail;
 	}
 
 	if (!common.apr_q6_cvs) {
 		pr_err("%s: apr_cvs is NULL.\n", __func__);
-
+		ret = -EINVAL;
 		goto fail;
 	}
 
@@ -4113,6 +4753,7 @@ static int voice_send_stream_mute_cmd(struct voice_data *v, uint16_t direction,
 	cvs_mute_cmd.cvs_set_mute.ramp_duration_ms = ramp_duration;
 
 	v->cvs_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(common.apr_q6_cvs, (uint32_t *) &cvs_mute_cmd);
 	if (ret < 0) {
 		pr_err("%s: Error %d sending stream mute\n", __func__, ret);
@@ -4124,14 +4765,21 @@ static int voice_send_stream_mute_cmd(struct voice_data *v, uint16_t direction,
 				 msecs_to_jiffies(TIMEOUT_MS));
 	if (!ret) {
 		pr_err("%s: Command timeout\n", __func__);
-
+		goto fail;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto fail;
 	}
 
 	return 0;
 
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_device_mute_cmd(struct voice_data *v, uint16_t direction,
@@ -4142,13 +4790,13 @@ static int voice_send_device_mute_cmd(struct voice_data *v, uint16_t direction,
 
 	if (v == NULL) {
 		pr_err("%s: v is NULL\n", __func__);
-
+		ret = -EINVAL;
 		goto fail;
 	}
 
 	if (!common.apr_q6_cvp) {
 		pr_err("%s: apr_cvp is NULL.\n", __func__);
-
+		ret = -EINVAL;
 		goto fail;
 	}
 
@@ -4167,6 +4815,7 @@ static int voice_send_device_mute_cmd(struct voice_data *v, uint16_t direction,
 	cvp_mute_cmd.cvp_set_mute.ramp_duration_ms = ramp_duration;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(common.apr_q6_cvp, (uint32_t *) &cvp_mute_cmd);
 	if (ret < 0) {
 		pr_err("%s: Error %d sending rx device cmd\n", __func__, ret);
@@ -4178,14 +4827,21 @@ static int voice_send_device_mute_cmd(struct voice_data *v, uint16_t direction,
 				 msecs_to_jiffies(TIMEOUT_MS));
 	if (!ret) {
 		pr_err("%s: Command timeout\n", __func__);
-
+		goto fail;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto fail;
 	}
 
 	return 0;
 
 fail:
-	return -EINVAL;
+	return ret;
 }
 
 static int voice_send_vol_step_cmd(struct voice_data *v)
@@ -4227,6 +4883,7 @@ static int voice_send_vol_step_cmd(struct voice_data *v)
 			cvp_vol_step_cmd.cvp_set_vol_step.ramp_duration_ms);
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_cvp, (uint32_t *) &cvp_vol_step_cmd);
 	if (ret < 0) {
 		pr_err("Fail in sending RX VOL step\n");
@@ -4238,6 +4895,14 @@ static int voice_send_vol_step_cmd(struct voice_data *v)
 	if (!ret) {
 		pr_err("%s: wait_event timeout\n", __func__);
 		return -EINVAL;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
+		return ret;
 	}
 	return 0;
 }
@@ -4302,6 +4967,7 @@ static int voice_cvs_start_record(struct voice_data *v, uint32_t rec_mode)
 		}
 
 		v->cvs_state = CMD_STATUS_FAIL;
+		v->async_err = 0;
 
 		ret = apr_send_pkt(apr_cvs, (uint32_t *) &cvs_start_record);
 		if (ret < 0) {
@@ -4318,6 +4984,14 @@ static int voice_cvs_start_record(struct voice_data *v, uint32_t rec_mode)
 		if (!ret) {
 			pr_err("%s: wait_event timeout\n", __func__);
 
+			goto fail;
+		}
+		if (v->async_err > 0) {
+			pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+			ret = adsp_err_get_lnx_err_code(
+					v->async_err);
 			goto fail;
 		}
 		v->rec_info.recording = 1;
@@ -4363,6 +5037,7 @@ static int voice_cvs_stop_record(struct voice_data *v)
 		cvs_stop_record.opcode = VSS_IRECORD_CMD_STOP;
 
 		v->cvs_state = CMD_STATUS_FAIL;
+		v->async_err = 0;
 
 		ret = apr_send_pkt(apr_cvs, (uint32_t *) &cvs_stop_record);
 		if (ret < 0) {
@@ -4378,6 +5053,14 @@ static int voice_cvs_stop_record(struct voice_data *v)
 		if (!ret) {
 			pr_err("%s: wait_event timeout\n", __func__);
 
+			goto fail;
+		}
+		if (v->async_err > 0) {
+			pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+			ret = adsp_err_get_lnx_err_code(
+					v->async_err);
 			goto fail;
 		}
 		v->rec_info.recording = 0;
@@ -4562,6 +5245,7 @@ static int voice_cvs_start_playback(struct voice_data *v)
 						v->music_info.port_id;
 
 		v->cvs_state = CMD_STATUS_FAIL;
+		v->async_err = 0;
 
 		ret = apr_send_pkt(apr_cvs, (uint32_t *) &cvs_start_playback);
 
@@ -4578,6 +5262,14 @@ static int voice_cvs_start_playback(struct voice_data *v)
 		if (!ret) {
 			pr_err("%s: wait_event timeout\n", __func__);
 
+			goto fail;
+		}
+		if (v->async_err > 0) {
+			pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+			ret = adsp_err_get_lnx_err_code(
+					v->async_err);
 			goto fail;
 		}
 
@@ -4627,6 +5319,7 @@ static int voice_cvs_stop_playback(struct voice_data *v)
 		cvs_stop_playback.opcode = VSS_IPLAYBACK_CMD_STOP;
 
 		v->cvs_state = CMD_STATUS_FAIL;
+		v->async_err = 0;
 
 		ret = apr_send_pkt(apr_cvs, (uint32_t *) &cvs_stop_playback);
 		if (ret < 0) {
@@ -4645,6 +5338,14 @@ static int voice_cvs_stop_playback(struct voice_data *v)
 
 			goto fail;
 		}
+		if (v->async_err > 0) {
+			pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+			ret = adsp_err_get_lnx_err_code(
+					v->async_err);
+			goto fail;
+		}
 
 		v->music_info.playing = 0;
 		v->music_info.force = 0;
@@ -4658,58 +5359,30 @@ fail:
 	return ret;
 }
 
-static int voice_lch_setup_vocproc(struct voice_data *v)
-{
-	int ret = 0;
-
-	ret = voice_setup_vocproc(v);
-	if (ret < 0) {
-		pr_err("%s: setup vocproc failed %d\n", __func__, ret);
-		goto done;
-	}
-
-	ret = voice_send_vol_step_cmd(v);
-	if (ret < 0)
-		pr_err("%s: voice volume failed %d\n", __func__, ret);
-
-	/* Reset lch mode when VOICE_LCH_STOP is recieved */
-	v->lch_mode = 0;
-
-	ret = voice_send_stream_mute_cmd(v,
-				VSS_IVOLUME_DIRECTION_TX,
-				v->stream_tx.stream_mute,
-				v->stream_tx.stream_mute_ramp_duration_ms);
-	if (ret < 0)
-		pr_err("%s: voice mute failed %d\n", __func__, ret);
-
-	ret = voice_send_start_voice_cmd(v);
-	if (ret < 0) {
-		pr_err("%s: start voice failed %d\n", __func__, ret);
-		goto done;
-	}
-
-	v->voc_state = VOC_RUN;
-done:
-	return ret;
-}
-
 static int voc_lch_ops(struct voice_data *v, enum voice_lch_mode lch_mode)
 {
 	int ret = 0;
 
+	if (v == NULL) {
+		pr_err("%s: v is NULL\n", __func__);
+
+		ret = -EINVAL;
+		goto done;
+	}
+
 	switch (lch_mode) {
 	case VOICE_LCH_START:
 
-		ret = voice_destroy_vocproc(v);
+		ret = voc_end_voice_call(v->session_id);
 		if (ret < 0)
-			pr_err("%s:destroy vocproc failed %d\n",
+			pr_err("%s: voice call end failed %d\n",
 				__func__, ret);
 		break;
 	case VOICE_LCH_STOP:
 
-		ret = voice_lch_setup_vocproc(v);
+		ret = voc_start_voice_call(v->session_id);
 		if (ret < 0) {
-			pr_err("%s:setup vocproc failed %d\n",
+			pr_err("%s: voice call start failed %d\n",
 				__func__, ret);
 			goto done;
 		}
@@ -4763,138 +5436,6 @@ int voc_start_playback(uint32_t set, uint16_t port_id)
 		}
 	}
 
-	return ret;
-}
-
-static int voice_disable_cvp(uint32_t session_id)
-{
-	struct voice_data *v = voice_get_session(session_id);
-	int ret = 0;
-
-	if (v == NULL) {
-		pr_err("%s: invalid session_id 0x%x\n", __func__, session_id);
-
-		return -EINVAL;
-	}
-
-	mutex_lock(&v->lock);
-
-	if (v->voc_state == VOC_RUN) {
-		rtac_remove_voice(voice_get_cvs_handle(v));
-		/* send cmd to dsp to disable vocproc */
-		ret = voice_send_disable_vocproc_cmd(v);
-		if (ret < 0) {
-			pr_err("%s:  disable vocproc failed\n", __func__);
-
-			mutex_unlock(&v->lock);
-			goto done;
-		}
-
-		voice_send_cvp_deregister_vol_cal_cmd(v);
-		voice_send_cvp_deregister_cal_cmd(v);
-		voice_send_cvp_deregister_dev_cfg_cmd(v);
-
-		v->voc_state = VOC_CHANGE;
-	}
-	mutex_unlock(&v->lock);
-
-	if (common.ec_ref_ext)
-		voc_set_ext_ec_ref(AFE_PORT_INVALID, false);
-
-done:
-	return ret;
-}
-
-static int voice_enable_cvp(uint32_t session_id)
-{
-	struct voice_data *v = voice_get_session(session_id);
-	int ret = 0;
-
-	if (v == NULL) {
-		pr_err("%s: Invalid session_id 0x%x\n", __func__, session_id);
-
-		return -EINVAL;
-	}
-
-	mutex_lock(&v->lock);
-
-	if (v->voc_state == VOC_CHANGE) {
-		ret = voice_send_set_device_cmd(v);
-		if (ret < 0) {
-			pr_err("%s:  Set device failed\n", __func__);
-			goto fail;
-		}
-
-		voice_send_cvp_register_dev_cfg_cmd(v);
-		voice_send_cvp_register_cal_cmd(v);
-		voice_send_cvp_register_vol_cal_cmd(v);
-
-		if (v->lch_mode == VOICE_LCH_START) {
-			pr_debug("%s: TX and RX mute ON\n", __func__);
-
-			voice_send_device_mute_cmd(v,
-						VSS_IVOLUME_DIRECTION_TX,
-						VSS_IVOLUME_MUTE_ON,
-						DEFAULT_MUTE_RAMP_DURATION);
-			voice_send_device_mute_cmd(v,
-						VSS_IVOLUME_DIRECTION_RX,
-						VSS_IVOLUME_MUTE_ON,
-						DEFAULT_MUTE_RAMP_DURATION);
-			/* Send unmute cmd as the TX stream
-			 * might be muted previously
-			 */
-			voice_send_stream_mute_cmd(v,
-						VSS_IVOLUME_DIRECTION_TX,
-						VSS_IVOLUME_MUTE_OFF,
-						DEFAULT_MUTE_RAMP_DURATION);
-		} else if (v->lch_mode == VOICE_LCH_STOP) {
-			pr_debug("%s: TX and RX mute OFF\n", __func__);
-
-			voice_send_device_mute_cmd(v,
-						VSS_IVOLUME_DIRECTION_TX,
-						VSS_IVOLUME_MUTE_OFF,
-						DEFAULT_MUTE_RAMP_DURATION);
-			voice_send_device_mute_cmd(v,
-						VSS_IVOLUME_DIRECTION_RX,
-						VSS_IVOLUME_MUTE_OFF,
-						DEFAULT_MUTE_RAMP_DURATION);
-			/* Reset lch mode when VOICE_LCH_STOP is recieved */
-			v->lch_mode = 0;
-			/* Apply cached mute setting */
-			voice_send_stream_mute_cmd(v,
-				VSS_IVOLUME_DIRECTION_TX,
-				v->stream_tx.stream_mute,
-				v->stream_tx.stream_mute_ramp_duration_ms);
-		} else {
-			pr_debug("%s: Mute commands not sent for lch_mode=%d\n",
-				 __func__, v->lch_mode);
-		}
-
-		ret = voice_send_enable_vocproc_cmd(v);
-		if (ret < 0) {
-			pr_err("%s: Enable vocproc failed %d\n", __func__, ret);
-
-			goto fail;
-		}
-
-		voice_send_tty_mode_cmd(v);
-		if (v->st_enable && !v->tty_mode)
-			voice_send_set_pp_enable_cmd(v,
-					     MODULE_ID_VOICE_MODULE_ST,
-					     v->st_enable);
-
-		if (v->hd_enable)
-			voice_send_hd_cmd(v, v->hd_enable);
-
-		rtac_add_voice(voice_get_cvs_handle(v),
-			voice_get_cvp_handle(v),
-			v->dev_rx.port_id, v->dev_tx.port_id,
-			v->session_id);
-		v->voc_state = VOC_RUN;
-	}
-
-fail:
-	mutex_unlock(&v->lock);
 	return ret;
 }
 
@@ -5196,25 +5737,28 @@ int voc_set_rx_vol_step(uint32_t session_id, uint32_t dir, uint32_t vol_step,
 	return ret;
 }
 
-int voc_set_rxtx_port(uint32_t session_id, uint32_t port_id, uint32_t dev_type)
+int voc_set_device_config(uint32_t session_id, uint8_t path_dir,
+			  uint8_t no_of_channels, uint32_t port_id)
 {
 	struct voice_data *v = voice_get_session(session_id);
 
 	if (v == NULL) {
-		pr_err("%s: invalid session_id 0x%x\n", __func__, session_id);
+		pr_err("%s: Invalid session_id 0x%x\n", __func__, session_id);
 
 		return -EINVAL;
 	}
 
-	pr_debug("%s: port_id=%d, type=%d\n", __func__, port_id, dev_type);
+	pr_debug("%s: path_dir=%d port_id=%x, channels=%d\n",
+		 __func__, path_dir, port_id, no_of_channels);
 
 	mutex_lock(&v->lock);
-
-	if (dev_type == DEV_RX)
+	if (path_dir == RX_PATH) {
 		v->dev_rx.port_id = q6audio_get_port_id(port_id);
-	else
+		v->dev_rx.no_of_channels = no_of_channels;
+	} else {
 		v->dev_tx.port_id = q6audio_get_port_id(port_id);
-
+		v->dev_tx.no_of_channels = no_of_channels;
+	}
 	mutex_unlock(&v->lock);
 
 	return 0;
@@ -5303,8 +5847,6 @@ int voc_end_voice_call(uint32_t session_id)
 
 		ret = -EINVAL;
 	}
-	if (common.ec_ref_ext)
-		voc_set_ext_ec_ref(AFE_PORT_INVALID, false);
 
 	mutex_unlock(&v->lock);
 	return ret;
@@ -5318,11 +5860,12 @@ int voc_standby_voice_call(uint32_t session_id)
 	u16 mvm_handle;
 	int ret = 0;
 
-	pr_debug("%s: voc state=%d", __func__, v->voc_state);
 	if (v == NULL) {
 		pr_err("%s: v is NULL\n", __func__);
 		return -EINVAL;
 	}
+	pr_debug("%s: voc state=%d", __func__, v->voc_state);
+
 	if (v->voc_state == VOC_RUN) {
 		apr_mvm = common.apr_q6_mvm;
 		if (!apr_mvm) {
@@ -5363,11 +5906,12 @@ int voc_disable_device(uint32_t session_id)
 	struct voice_data *v = voice_get_session(session_id);
 	int ret = 0;
 
-	pr_debug("%s: voc state=%d\n", __func__, v->voc_state);
 	if (v == NULL) {
 		pr_err("%s: v is NULL\n", __func__);
 		return -EINVAL;
 	}
+
+	pr_debug("%s: voc state=%d\n", __func__, v->voc_state);
 
 	mutex_lock(&v->lock);
 	if (v->voc_state == VOC_RUN) {
@@ -5388,8 +5932,6 @@ int voc_disable_device(uint32_t session_id)
 			 __func__, v->voc_state);
 	}
 
-	if (common.ec_ref_ext)
-		voc_set_ext_ec_ref(AFE_PORT_INVALID, false);
 done:
 	mutex_unlock(&v->lock);
 
@@ -5401,12 +5943,12 @@ int voc_enable_device(uint32_t session_id)
 	struct voice_data *v = voice_get_session(session_id);
 	int ret = 0;
 
-	pr_debug("%s: voc state=%d\n", __func__, v->voc_state);
 	if (v == NULL) {
 		pr_err("%s: v is NULL\n", __func__);
 		return -EINVAL;
 	}
 
+	pr_debug("%s: voc state=%d\n", __func__, v->voc_state);
 	mutex_lock(&v->lock);
 	if (v->voc_state == VOC_CHANGE) {
 		ret = voice_send_tty_mode_cmd(v);
@@ -5435,6 +5977,18 @@ int voc_enable_device(uint32_t session_id)
 			goto done;
 		}
 
+		ret = voice_send_cvp_device_channels_cmd(v);
+		if (ret < 0) {
+			pr_err("%s:  Set device channels failed\n", __func__);
+			goto done;
+		}
+
+		ret = voice_send_cvp_topology_commit_cmd(v);
+		if (ret < 0) {
+			pr_err("%s:  Set topology commit failed\n", __func__);
+			goto done;
+		}
+
 		voice_send_cvp_register_dev_cfg_cmd(v);
 		voice_send_cvp_register_cal_cmd(v);
 		voice_send_cvp_register_vol_cal_cmd(v);
@@ -5442,6 +5996,7 @@ int voc_enable_device(uint32_t session_id)
 		rtac_add_voice(voice_get_cvs_handle(v),
 			       voice_get_cvp_handle(v),
 			       v->dev_rx.port_id, v->dev_tx.port_id,
+			       v->dev_rx.dev_id, v->dev_tx.dev_id,
 			       v->session_id);
 
 		ret = voice_send_start_voice_cmd(v);
@@ -5486,31 +6041,10 @@ int voc_set_lch(uint32_t session_id, enum voice_lch_mode lch_mode)
 	v->lch_mode = lch_mode;
 	mutex_unlock(&v->lock);
 
-	/* destroy vocproc session during local call hold for memory constraint
-	 * devices and recreate vocproc during local call unhold
-	 */
-	if (common.is_destroy_cvd) {
-		ret = voc_lch_ops(v, v->lch_mode);
-		if (ret < 0) {
-			pr_err("%s: lch ops failed %d for low memory device\n",
-				__func__, ret);
-			goto done;
-		}
-	} else {
-		ret = voice_disable_cvp(session_id);
-		if (ret < 0) {
-			pr_err("%s: voice_disable_cvp failed ret=%d\n",
-				__func__, ret);
-			goto done;
-		}
-
-		/* Mute and topology_none are set during vocproc enable */
-		ret = voice_enable_cvp(session_id);
-		if (ret < 0) {
-			pr_err("%s: voice_enable_cvp failed ret=%d\n",
-				 __func__, ret);
-			goto done;
-		}
+	ret = voc_lch_ops(v, v->lch_mode);
+	if (ret < 0) {
+		pr_err("%s: lch ops failed %d\n", __func__, ret);
+		goto done;
 	}
 
 done:
@@ -5560,6 +6094,17 @@ int voc_start_voice_call(uint32_t session_id)
 			pr_err("%s:  apr register failed\n", __func__);
 			goto fail;
 		}
+
+		if (is_cvd_version_queried()) {
+			pr_debug("%s: Returning the cached value %s\n",
+				 __func__, common.cvd_version);
+		} else {
+			ret = voice_send_mvm_cvd_version_cmd(v);
+			if (ret < 0)
+				pr_debug("%s: Error retrieving CVD version %d\n",
+					 __func__, ret);
+		}
+
 		ret = voice_create_mvm_cvs_session(v);
 		if (ret < 0) {
 			pr_err("create mvm and cvs failed\n");
@@ -5703,40 +6248,35 @@ static int32_t qdsp_mvm_callback(struct apr_client_data *data, void *priv)
 		data->payload_size, data->opcode);
 
 	if (data->opcode == RESET_EVENTS) {
-
-		if (data->reset_proc == APR_DEST_MODEM) {
-			pr_debug("%s: Received MODEM reset event\n", __func__);
-
-		} else {
-			pr_debug("%s: Reset event received in Voice service\n",
+		pr_debug("%s: Reset event received in Voice service\n",
 				__func__);
 
-			if (common.mvs_info.ssr_cb) {
-				pr_debug("%s: Informing reset event to VoIP\n",
+		if (common.mvs_info.ssr_cb) {
+			pr_debug("%s: Informing reset event to VoIP\n",
 					__func__);
-				common.mvs_info.ssr_cb(data->opcode,
-						common.mvs_info.private_data);
-			}
+			common.mvs_info.ssr_cb(data->opcode,
+					common.mvs_info.private_data);
+		}
 
-			apr_reset(c->apr_q6_mvm);
-			c->apr_q6_mvm = NULL;
+		apr_reset(c->apr_q6_mvm);
+		c->apr_q6_mvm = NULL;
 
-			/* clean up memory handle */
-			c->cal_mem_handle = 0;
-			c->rtac_mem_handle = 0;
-			cal_utils_clear_cal_block_q6maps(MAX_VOICE_CAL_TYPES,
+		/* clean up memory handle */
+		c->cal_mem_handle = 0;
+		c->rtac_mem_handle = 0;
+		cal_utils_clear_cal_block_q6maps(MAX_VOICE_CAL_TYPES,
 				common.cal_data);
-			rtac_clear_mapping(VOICE_RTAC_CAL);
+		rtac_clear_mapping(VOICE_RTAC_CAL);
 
-			/* Sub-system restart is applicable to all sessions. */
-			for (i = 0; i < MAX_VOC_SESSIONS; i++) {
-				c->voice[i].mvm_handle = 0;
-				c->voice[i].shmem_info.mem_handle = 0;
-			}
+		/* Sub-system restart is applicable to all sessions. */
+		for (i = 0; i < MAX_VOC_SESSIONS; i++) {
+			c->voice[i].mvm_handle = 0;
+			c->voice[i].shmem_info.mem_handle = 0;
+		}
 
 		/* Free the ION memory and clear handles for Source Tracking */
-			if (is_source_tracking_shared_memomry_allocated()) {
-				msm_audio_ion_free(
+		if (is_source_tracking_shared_memomry_allocated()) {
+			msm_audio_ion_free(
 			common.source_tracking_sh_mem.sh_mem_block.client,
 			common.source_tracking_sh_mem.sh_mem_block.handle);
 			common.source_tracking_sh_mem.mem_handle = 0;
@@ -5744,7 +6284,6 @@ static int32_t qdsp_mvm_callback(struct apr_client_data *data, void *priv)
 									NULL;
 			common.source_tracking_sh_mem.sh_mem_block.handle =
 									NULL;
-			}
 		}
 		/* clean up srvcc rec flag */
 		c->srvcc_rec_flag = false;
@@ -5780,6 +6319,7 @@ static int32_t qdsp_mvm_callback(struct apr_client_data *data, void *priv)
 				} else
 					pr_err("got NACK for sending MVM create session\n");
 				v->mvm_state = CMD_STATUS_SUCCESS;
+				v->async_err = ptr[1];
 				wake_up(&v->mvm_wait);
 				break;
 			case VSS_IMVM_CMD_START_VOICE:
@@ -5803,6 +6343,7 @@ static int32_t qdsp_mvm_callback(struct apr_client_data *data, void *priv)
 			case VSS_IHDVOICE_CMD_DISABLE:
 				pr_debug("%s: cmd = 0x%x\n", __func__, ptr[0]);
 				v->mvm_state = CMD_STATUS_SUCCESS;
+				v->async_err = ptr[1];
 				wake_up(&v->mvm_wait);
 				break;
 			case VSS_IVERSION_CMD_GET:
@@ -5815,6 +6356,7 @@ static int32_t qdsp_mvm_callback(struct apr_client_data *data, void *priv)
 					 __func__, common.cvd_version);
 
 				v->mvm_state = CMD_STATUS_SUCCESS;
+				v->async_err = ptr[1];
 				wake_up(&v->mvm_wait);
 				break;
 			default:
@@ -5926,26 +6468,22 @@ static int32_t qdsp_cvs_callback(struct apr_client_data *data, void *priv)
 		data->payload_size, data->opcode);
 
 	if (data->opcode == RESET_EVENTS) {
-		if (data->reset_proc == APR_DEST_MODEM) {
-			pr_debug("%s: Received Modem reset event\n", __func__);
+		pr_debug("%s: Reset event received in Voice service\n",
+				__func__);
 
-		} else {
-			pr_debug("%s: Reset event received in Voice service\n",
-				 __func__);
+		apr_reset(c->apr_q6_cvs);
+		c->apr_q6_cvs = NULL;
 
-			apr_reset(c->apr_q6_cvs);
-			c->apr_q6_cvs = NULL;
+		/* Sub-system restart is applicable to all sessions. */
+		for (i = 0; i < MAX_VOC_SESSIONS; i++)
+			c->voice[i].cvs_handle = 0;
 
-			/* Sub-system restart is applicable to all sessions. */
-			for (i = 0; i < MAX_VOC_SESSIONS; i++)
-				c->voice[i].cvs_handle = 0;
-
-			cal_utils_clear_cal_block_q6maps(MAX_VOICE_CAL_TYPES,
+		cal_utils_clear_cal_block_q6maps(MAX_VOICE_CAL_TYPES,
 				common.cal_data);
 
 		/* Free the ION memory and clear handles for Source Tracking */
-			if (is_source_tracking_shared_memomry_allocated()) {
-				msm_audio_ion_free(
+		if (is_source_tracking_shared_memomry_allocated()) {
+			msm_audio_ion_free(
 			common.source_tracking_sh_mem.sh_mem_block.client,
 			common.source_tracking_sh_mem.sh_mem_block.handle);
 			common.source_tracking_sh_mem.mem_handle = 0;
@@ -5953,9 +6491,7 @@ static int32_t qdsp_cvs_callback(struct apr_client_data *data, void *priv)
 									NULL;
 			common.source_tracking_sh_mem.sh_mem_block.handle =
 									NULL;
-			}
 		}
-
 		voc_set_error_state(data->reset_proc);
 		return 0;
 	}
@@ -5987,6 +6523,7 @@ static int32_t qdsp_cvs_callback(struct apr_client_data *data, void *priv)
 				} else
 					pr_err("got NACK for sending CVS create session\n");
 				v->cvs_state = CMD_STATUS_SUCCESS;
+				v->async_err = ptr[1];
 				wake_up(&v->cvs_wait);
 				break;
 			case VSS_IVOLUME_CMD_MUTE_V2:
@@ -6012,6 +6549,7 @@ static int32_t qdsp_cvs_callback(struct apr_client_data *data, void *priv)
 			case VSS_ISTREAM_CMD_SET_RX_DTMF_DETECTION:
 				pr_debug("%s: cmd = 0x%x\n", __func__, ptr[0]);
 				v->cvs_state = CMD_STATUS_SUCCESS;
+				v->async_err = ptr[1];
 				wake_up(&v->cvs_wait);
 				break;
 			case VOICE_CMD_SET_PARAM:
@@ -6204,28 +6742,24 @@ static int32_t qdsp_cvp_callback(struct apr_client_data *data, void *priv)
 	c = priv;
 
 	if (data->opcode == RESET_EVENTS) {
-		if (data->reset_proc == APR_DEST_MODEM) {
-			pr_debug("%s: Received Modem reset event\n", __func__);
+		pr_debug("%s: Reset event received in Voice service\n",
+				__func__);
 
-		} else {
-			pr_debug("%s: Reset event received in Voice service\n",
-				 __func__);
-
-			apr_reset(c->apr_q6_cvp);
-			c->apr_q6_cvp = NULL;
-			cal_utils_clear_cal_block_q6maps(MAX_VOICE_CAL_TYPES,
+		apr_reset(c->apr_q6_cvp);
+		c->apr_q6_cvp = NULL;
+		cal_utils_clear_cal_block_q6maps(MAX_VOICE_CAL_TYPES,
 				common.cal_data);
 
-			/* Sub-system restart is applicable to all sessions. */
-			for (i = 0; i < MAX_VOC_SESSIONS; i++)
-				c->voice[i].cvp_handle = 0;
+		/* Sub-system restart is applicable to all sessions. */
+		for (i = 0; i < MAX_VOC_SESSIONS; i++)
+			c->voice[i].cvp_handle = 0;
 
-			/*
-			 * Free the ION memory and clear handles for
-			 * Source Tracking
-			 */
-			if (is_source_tracking_shared_memomry_allocated()) {
-				msm_audio_ion_free(
+		/*
+		 * Free the ION memory and clear handles for
+		 * Source Tracking
+		 */
+		if (is_source_tracking_shared_memomry_allocated()) {
+			msm_audio_ion_free(
 			common.source_tracking_sh_mem.sh_mem_block.client,
 			common.source_tracking_sh_mem.sh_mem_block.handle);
 			common.source_tracking_sh_mem.mem_handle = 0;
@@ -6233,9 +6767,7 @@ static int32_t qdsp_cvp_callback(struct apr_client_data *data, void *priv)
 									NULL;
 			common.source_tracking_sh_mem.sh_mem_block.handle =
 									NULL;
-			}
 		}
-
 		voc_set_error_state(data->reset_proc);
 		return 0;
 	}
@@ -6258,6 +6790,7 @@ static int32_t qdsp_cvp_callback(struct apr_client_data *data, void *priv)
 			}
 			switch (ptr[0]) {
 			case VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2:
+			case VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V3:
 			/*response from  CVP */
 				pr_debug("%s: cmd = 0x%x\n", __func__, ptr[0]);
 				if (!ptr[1]) {
@@ -6267,9 +6800,11 @@ static int32_t qdsp_cvp_callback(struct apr_client_data *data, void *priv)
 				} else
 					pr_err("got NACK from CVP create session response\n");
 				v->cvp_state = CMD_STATUS_SUCCESS;
+				v->async_err = ptr[1];
 				wake_up(&v->cvp_wait);
 				break;
 			case VSS_IVOCPROC_CMD_SET_DEVICE_V2:
+			case VSS_IVOCPROC_CMD_SET_DEVICE_V3:
 			case VSS_IVOLUME_CMD_SET_STEP:
 			case VSS_IVOCPROC_CMD_ENABLE:
 			case VSS_IVOCPROC_CMD_DISABLE:
@@ -6289,7 +6824,10 @@ static int32_t qdsp_cvp_callback(struct apr_client_data *data, void *priv)
 			case VSS_IVOLUME_CMD_MUTE_V2:
 			case VSS_IVPCM_CMD_START_V2:
 			case VSS_IVPCM_CMD_STOP:
+			case VSS_IVOCPROC_CMD_TOPOLOGY_SET_DEV_CHANNELS:
+			case VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT:
 				v->cvp_state = CMD_STATUS_SUCCESS;
+				v->async_err = ptr[1];
 				wake_up(&v->cvp_wait);
 				break;
 			case VSS_IVPCM_EVT_PUSH_BUFFER_V2:
@@ -6315,13 +6853,14 @@ static int32_t qdsp_cvp_callback(struct apr_client_data *data, void *priv)
 				}
 				break;
 			case VSS_ISOUNDFOCUS_CMD_SET_SECTORS:
-				if (ptr[1] == 0)
+				if (!ptr[1])
 					common.is_sound_focus_resp_success =
 									true;
 				else
 					common.is_sound_focus_resp_success =
 									false;
 				v->cvp_state = CMD_STATUS_SUCCESS;
+				v->async_err = ptr[1];
 				wake_up(&v->cvp_wait);
 				break;
 			case VSS_ISOUNDFOCUS_CMD_GET_SECTORS:
@@ -6336,10 +6875,11 @@ static int32_t qdsp_cvp_callback(struct apr_client_data *data, void *priv)
 
 				common.is_sound_focus_resp_success = false;
 				v->cvp_state = CMD_STATUS_SUCCESS;
+				v->async_err = ptr[1];
 				wake_up(&v->cvp_wait);
 				break;
 			case VSS_ISOURCETRACK_CMD_GET_ACTIVITY:
-				if (ptr[1] == 0) {
+				if (!ptr[1]) {
 					/* Read data from shared memory */
 					memcpy(&common.sourceTrackingResponse,
 					       common.source_tracking_sh_mem.
@@ -6355,6 +6895,7 @@ static int32_t qdsp_cvp_callback(struct apr_client_data *data, void *priv)
 						__func__);
 				}
 				v->cvp_state = CMD_STATUS_SUCCESS;
+				v->async_err = ptr[1];
 				wake_up(&v->cvp_wait);
 				break;
 			default:
@@ -6381,8 +6922,7 @@ static int32_t qdsp_cvp_callback(struct apr_client_data *data, void *priv)
 					common.hostpcm_info.private_data);
 		}
 	} else if (data->opcode == VSS_ISOUNDFOCUS_RSP_GET_SECTORS) {
-		if ((data->payload != NULL) &&
-		    (data->payload_size ==
+		if (data->payload && (data->payload_size ==
 			sizeof(struct vss_isoundfocus_rsp_get_sectors_t))) {
 			common.is_sound_focus_resp_success = true;
 			memcpy(&common.soundFocusResponse,
@@ -6591,6 +7131,7 @@ int voc_send_cvp_start_vocpcm(uint32_t session_id,
 	cvp_start_cmd.vpcm_start_cmd.num_tap_points = no_of_tp;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_cvp, (uint32_t *) &cvp_start_cmd);
 	if (ret < 0) {
 		pr_err("%s: Fail: sending vocpcm map memory,\n", __func__);
@@ -6601,6 +7142,14 @@ int voc_send_cvp_start_vocpcm(uint32_t session_id,
 			msecs_to_jiffies(TIMEOUT_MS));
 	if (!ret) {
 		pr_err("%s: wait_event timeout\n", __func__);
+		goto done;
+	}
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto done;
 	}
 
@@ -6642,6 +7191,7 @@ int voc_send_cvp_stop_vocpcm(uint32_t session_id)
 	vpcm_stop_cmd.hdr.opcode = VSS_IVPCM_CMD_STOP;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_cvp, (uint32_t *) &vpcm_stop_cmd);
 	if (ret < 0) {
 		pr_err("Fail: sending vocpcm stop,\n");
@@ -6652,6 +7202,15 @@ int voc_send_cvp_stop_vocpcm(uint32_t session_id)
 			msecs_to_jiffies(TIMEOUT_MS));
 	if (!ret) {
 		pr_err("%s: wait_event timeout\n", __func__);
+		goto done;
+	}
+
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto done;
 	}
 
@@ -6762,18 +7321,8 @@ void voc_deregister_hpcm_evt_cb(void)
 int voc_get_cvd_version(char *cvd_version)
 {
 	int ret = 0;
-	struct apr_hdr cvd_version_get_cmd;
 	struct voice_data *v = voice_get_session(VOICE_SESSION_VSID);
-	void *apr_handle_mvm = NULL;
 
-	if (strcmp(common.cvd_version, CVD_VERSION_DEFAULT)) {
-		pr_debug("%s: Already attempted querying CVD version, return the cached value %s\n",
-			 __func__, common.cvd_version);
-
-		memcpy(cvd_version, common.cvd_version,
-			CVD_VERSION_STRING_MAX_SIZE);
-		goto done;
-	}
 
 	if (v == NULL) {
 		pr_err("%s: invalid session_id 0x%x\n",
@@ -6783,81 +7332,38 @@ int voc_get_cvd_version(char *cvd_version)
 		goto done;
 	}
 
-	mutex_lock(&common.common_lock);
-	mutex_lock(&v->lock);
+	if (is_cvd_version_queried()) {
+		pr_debug("%s: Returning the cached value %s\n",
+			 __func__, common.cvd_version);
+
+		goto done;
+	}
 
 	/* Register callback to APR */
-	if (apr_handle_mvm == NULL) {
-		pr_debug("%s: Register MVM callback\n", __func__);
-
-		apr_handle_mvm = apr_register("ADSP", "MVM",
-					      qdsp_mvm_callback,
-					      0xFFFFFFFF, &common);
-
-		if (apr_handle_mvm == NULL) {
-			pr_err("%s: Unable to register MVM\n", __func__);
-
-			strlcpy(common.cvd_version, CVD_VERSION_0_0,
-				sizeof(common.cvd_version));
-			ret = -EINVAL;
-			goto unlock;
-		}
-	}
-
-	/* Send command to CVD to retrive Version */
-	cvd_version_get_cmd.hdr_field = APR_HDR_FIELD(
-				APR_MSG_TYPE_SEQ_CMD,
-				APR_HDR_LEN(APR_HDR_SIZE),
-				APR_PKT_VER);
-	cvd_version_get_cmd.pkt_size = APR_PKT_SIZE(
-				APR_HDR_SIZE,
-				sizeof(cvd_version_get_cmd) -
-				APR_HDR_SIZE);
-	cvd_version_get_cmd.src_port =
-		voice_get_idx_for_session(v->session_id);
-	cvd_version_get_cmd.dest_port = 0;
-	cvd_version_get_cmd.token = 0;
-	cvd_version_get_cmd.opcode = VSS_IVERSION_CMD_GET;
-	v->mvm_state = CMD_STATUS_FAIL;
-
-	pr_debug("%s: send CVD version get cmd, pkt size = %d\n",
-		 __func__, cvd_version_get_cmd.pkt_size);
-
-	ret = apr_send_pkt(apr_handle_mvm,
-			   (uint32_t *) &cvd_version_get_cmd);
+	ret = voice_apr_register(VOICE_SESSION_VSID);
 	if (ret < 0) {
-		pr_err("%s: Error sending command, fall back to default\n",
-			__func__);
+		pr_err("%s: apr register failed\n", __func__);
+		goto done;
+	}
 
-		strlcpy(common.cvd_version, CVD_VERSION_0_0,
-			sizeof(common.cvd_version));
+	mutex_lock(&common.common_lock);
+	mutex_lock(&v->lock);
+	ret = voice_send_mvm_cvd_version_cmd(v);
+	if (ret < 0) {
+		pr_err("%s: voice_send_mvm_cvd_version_cmd failed\n", __func__);
 		goto unlock;
 	}
-	ret = wait_event_timeout(v->mvm_wait,
-			(v->mvm_state == CMD_STATUS_SUCCESS),
-			msecs_to_jiffies(TIMEOUT_MS));
-	if (!ret) {
-		pr_err("%s: wait_event timeout, fall back to default\n",
-			__func__);
-
-		strlcpy(common.cvd_version, CVD_VERSION_0_0,
-			sizeof(common.cvd_version));
-		ret = -EINVAL;
-		goto unlock;
-	}
-	pr_debug("%s: CVD Version retrieved=%s\n",
-		 __func__, common.cvd_version);
-
 	ret = 0;
+
 unlock:
-	if (apr_handle_mvm != NULL) {
-		apr_deregister(apr_handle_mvm);
-		apr_handle_mvm = NULL;
-	}
-	memcpy(cvd_version, common.cvd_version, CVD_VERSION_STRING_MAX_SIZE);
 	mutex_unlock(&v->lock);
 	mutex_unlock(&common.common_lock);
+
 done:
+	if (cvd_version)
+		memcpy(cvd_version, common.cvd_version,
+		       CVD_VERSION_STRING_MAX_SIZE);
+
 	return ret;
 }
 
@@ -7285,6 +7791,7 @@ static int voice_send_set_sound_focus_cmd(struct voice_data *v,
 	pr_debug("%s: gain_step = %d\n", __func__, soundFocusData.gain_step);
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 
 	ret = apr_send_pkt(apr_cvp, (uint32_t *)&cvp_set_sound_focus_param_cmd);
 	if (ret < 0) {
@@ -7300,6 +7807,15 @@ static int voice_send_set_sound_focus_cmd(struct voice_data *v,
 		pr_err("%s: wait_event timeout\n", __func__);
 
 		ret = -EINVAL;
+		goto done;
+	}
+
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto done;
 	}
 
@@ -7360,7 +7876,7 @@ static int voice_send_get_sound_focus_cmd(struct voice_data *v,
 
 	pr_debug("%s: Enter\n", __func__);
 
-	if (v == NULL) {
+	if (!v) {
 		pr_err("%s: v is NULL\n", __func__);
 
 		ret = -EINVAL;
@@ -7391,6 +7907,7 @@ static int voice_send_get_sound_focus_cmd(struct voice_data *v,
 	cvp_get_sound_focus_param_cmd.opcode = VSS_ISOUNDFOCUS_CMD_GET_SECTORS;
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_cvp, (uint32_t *)&cvp_get_sound_focus_param_cmd);
 	if (ret < 0) {
 		pr_err("%s: Error in sending APR command\n", __func__);
@@ -7405,6 +7922,15 @@ static int voice_send_get_sound_focus_cmd(struct voice_data *v,
 		pr_err("%s: wait_event timeout\n", __func__);
 
 		ret = -EINVAL;
+		goto done;
+	}
+
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto done;
 	}
 
@@ -7447,7 +7973,7 @@ int voc_get_sound_focus(struct sound_focus_param *soundFocusData)
 	mutex_lock(&common.common_lock);
 	voice_itr_init(&itr, ALL_SESSION_VSID);
 	while (voice_itr_get_next_session(&itr, &v)) {
-		if (v != NULL) {
+		if (v) {
 			mutex_lock(&v->lock);
 			if (is_voc_state_active(v->voc_state) &&
 				(v->lch_mode != VOICE_LCH_START) &&
@@ -7496,7 +8022,7 @@ static int voice_alloc_source_tracking_shared_memory(void)
 		&(common.source_tracking_sh_mem.sh_mem_block.handle),
 		BUFFER_BLOCK_SIZE,
 		&(common.source_tracking_sh_mem.sh_mem_block.phys),
-		&(common.source_tracking_sh_mem.sh_mem_block.size),
+		(size_t *)&(common.source_tracking_sh_mem.sh_mem_block.size),
 		&(common.source_tracking_sh_mem.sh_mem_block.data));
 	if (ret < 0) {
 		pr_err("%s: audio ION alloc failed for sh_mem block, ret = %d\n",
@@ -7512,14 +8038,14 @@ static int voice_alloc_source_tracking_shared_memory(void)
 		 __func__,
 		&(common.source_tracking_sh_mem.sh_mem_block.phys),
 		(void *)(common.source_tracking_sh_mem.sh_mem_block.data),
-		(common.source_tracking_sh_mem.sh_mem_block.size));
+		(size_t)(common.source_tracking_sh_mem.sh_mem_block.size));
 
 	ret = msm_audio_ion_alloc("source_tracking_sh_mem_table",
 		&(common.source_tracking_sh_mem.sh_mem_table.client),
 		&(common.source_tracking_sh_mem.sh_mem_table.handle),
 		sizeof(struct vss_imemory_table_t),
 		&(common.source_tracking_sh_mem.sh_mem_table.phys),
-		&(common.source_tracking_sh_mem.sh_mem_table.size),
+		(size_t *)&(common.source_tracking_sh_mem.sh_mem_table.size),
 		&(common.source_tracking_sh_mem.sh_mem_table.data));
 	if (ret < 0) {
 		pr_err("%s: audio ION alloc failed for sh_mem table, ret = %d\n",
@@ -7543,7 +8069,7 @@ static int voice_alloc_source_tracking_shared_memory(void)
 		 __func__,
 		&(common.source_tracking_sh_mem.sh_mem_table.phys),
 		(void *)(common.source_tracking_sh_mem.sh_mem_table.data),
-		(common.source_tracking_sh_mem.sh_mem_table.size));
+		(size_t)(common.source_tracking_sh_mem.sh_mem_table.size));
 
 done:
 	pr_debug("%s: Exit, ret=%d\n", __func__, ret);
@@ -7559,7 +8085,7 @@ static int voice_alloc_and_map_source_tracking_shared_memory(
 	pr_debug("%s: Enter\n", __func__);
 
 	ret = voice_alloc_source_tracking_shared_memory();
-	if (ret != 0) {
+	if (ret) {
 		pr_err("%s: Failed to allocate shared memory %d\n",
 			__func__, ret);
 
@@ -7572,7 +8098,7 @@ static int voice_alloc_and_map_source_tracking_shared_memory(
 			common.source_tracking_sh_mem.sh_mem_block.phys,
 			common.source_tracking_sh_mem.sh_mem_block.size,
 			VOC_SOURCE_TRACKING_MEM_MAP_TOKEN);
-	if (ret != 0) {
+	if (ret) {
 		pr_err("%s: memory mapping failed %d\n",
 			__func__, ret);
 
@@ -7639,7 +8165,7 @@ static int voice_send_get_source_tracking_cmd(struct voice_data *v,
 
 	pr_debug("%s: Enter\n", __func__);
 
-	if (v == NULL) {
+	if (!v) {
 		pr_err("%s: v is NULL\n", __func__);
 		return -EINVAL;
 	}
@@ -7654,7 +8180,7 @@ static int voice_send_get_source_tracking_cmd(struct voice_data *v,
 
 	if (!is_source_tracking_shared_memomry_allocated()) {
 		ret = voice_alloc_and_map_source_tracking_shared_memory(v);
-		if (ret != 0) {
+		if (ret) {
 			pr_err("%s: Fail in allocating/mapping shared memory\n",
 				__func__);
 
@@ -7674,17 +8200,22 @@ static int voice_send_get_source_tracking_cmd(struct voice_data *v,
 
 	st_cmd.cvp_get_source_tracking_param.mem_handle	=
 				 common.source_tracking_sh_mem.mem_handle;
-	st_cmd.cvp_get_source_tracking_param.mem_address =
-		(uint64_t)common.source_tracking_sh_mem.sh_mem_block.phys;
+	st_cmd.cvp_get_source_tracking_param.mem_address_lsw =
+		lower_32_bits(common.source_tracking_sh_mem.sh_mem_block.phys);
+	st_cmd.cvp_get_source_tracking_param.mem_address_msw =
+		msm_audio_populate_upper_32_bits(common.source_tracking_sh_mem.
+					sh_mem_block.phys);
 	st_cmd.cvp_get_source_tracking_param.mem_size =
 		(uint32_t)common.source_tracking_sh_mem.sh_mem_block.size;
-	pr_debug("%s: mem_handle=0x%x, mem_address=0x%llx, mem_size=%d\n",
+	pr_debug("%s: mem_handle=0x%x, mem_address_lsw=0x%x, msw=0x%x, mem_size=%d\n",
 		 __func__,
 		 st_cmd.cvp_get_source_tracking_param.mem_handle,
-		 (uint64_t)st_cmd.cvp_get_source_tracking_param.mem_address,
+		 st_cmd.cvp_get_source_tracking_param.mem_address_lsw,
+		 st_cmd.cvp_get_source_tracking_param.mem_address_msw,
 		 (uint32_t)st_cmd.cvp_get_source_tracking_param.mem_size);
 
 	v->cvp_state = CMD_STATUS_FAIL;
+	v->async_err = 0;
 	ret = apr_send_pkt(apr_cvp,
 			   (uint32_t *) &st_cmd);
 	if (ret < 0) {
@@ -7700,6 +8231,15 @@ static int voice_send_get_source_tracking_cmd(struct voice_data *v,
 		pr_err("%s: wait_event timeout\n", __func__);
 
 		ret = -EINVAL;
+		goto done;
+	}
+
+	if (v->async_err > 0) {
+		pr_err("%s: DSP returned error[%s]\n",
+				__func__, adsp_err_get_err_str(
+				v->async_err));
+		ret = adsp_err_get_lnx_err_code(
+				v->async_err);
 		goto done;
 	}
 
@@ -7826,6 +8366,10 @@ static int __init voice_init(void)
 
 		common.voice[i].dev_tx.port_id = 0x100B;
 		common.voice[i].dev_rx.port_id = 0x100A;
+		common.voice[i].dev_tx.dev_id = 0;
+		common.voice[i].dev_rx.dev_id = 0;
+		common.voice[i].dev_rx.no_of_channels = 0;
+		common.voice[i].dev_tx.no_of_channels = 0;
 		common.voice[i].sidetone_gain = 0x512;
 		common.voice[i].dtmf_rx_detect_en = 0;
 		common.voice[i].lch_mode = 0;

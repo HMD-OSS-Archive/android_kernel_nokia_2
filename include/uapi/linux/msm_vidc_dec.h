@@ -288,6 +288,8 @@ enum vdec_codec {
 	VDEC_CODECTYPE_VC1_RCV = 0xc,
 	VDEC_CODECTYPE_HEVC = 0xd,
 	VDEC_CODECTYPE_MVC = 0xe,
+	VDEC_CODECTYPE_VP8 = 0xf,
+	VDEC_CODECTYPE_VP9 = 0x10,
 };
 
 enum vdec_mpeg2_profile {
@@ -484,9 +486,14 @@ enum vdec_interlaced_format {
 	VDEC_InterlaceInterleaveFrameBottomFieldFirst = 0x4
 };
 
+#define VDEC_YUV_FORMAT_NV12_TP10_UBWC \
+	VDEC_YUV_FORMAT_NV12_TP10_UBWC
+
 enum vdec_output_fromat {
 	VDEC_YUV_FORMAT_NV12 = 0x1,
-	VDEC_YUV_FORMAT_TILE_4x2 = 0x2
+	VDEC_YUV_FORMAT_TILE_4x2 = 0x2,
+	VDEC_YUV_FORMAT_NV12_UBWC = 0x3,
+	VDEC_YUV_FORMAT_NV12_TP10_UBWC = 0x4
 };
 
 enum vdec_output_order {
@@ -542,6 +549,9 @@ struct vdec_aspectratioinfo {
 struct vdec_sep_metadatainfo {
 	void __user *metabufaddr;
 	uint32_t size;
+	int fd;
+	int offset;
+	uint32_t buffer_size;
 };
 
 struct vdec_output_frameinfo {

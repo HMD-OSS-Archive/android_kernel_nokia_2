@@ -10,7 +10,6 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
-
 / {
 	fao_batterydata: qcom,battery-data { /* NEED TO MODIFY*/
 		qcom,rpull-up-kohm = <100>;
@@ -23,12 +22,12 @@
 
 &pm8909_chg {
 	status = "ok";
+
 };
 
 &pm8909_bms {
 	status = "ok";
-	qcom,battery-data = <&fao_batterydata>;
-	qcom,shutdown-soc-valid-limit = <20>;
+	qcom,disable-bms;
 };
 
 
@@ -117,5 +116,5 @@
 };
 
 &wcnss {
-        qcom,wcnss-vadc = <&pm8909_vadc>;
+	qcom,wcnss-vadc = <&pm8909_vadc>;
 };

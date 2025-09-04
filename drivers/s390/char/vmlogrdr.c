@@ -313,7 +313,7 @@ static int vmlogrdr_open (struct inode *inode, struct file *filp)
 	int ret;
 
 	dev_num = iminor(inode);
-	if (dev_num > MAXMINOR)
+	if (dev_num >= MAXMINOR)
 		return -ENODEV;
 	logptr = &sys_ser[dev_num];
 
@@ -338,7 +338,6 @@ static int vmlogrdr_open (struct inode *inode, struct file *filp)
 
 	/* set the file options */
 	filp->private_data = logptr;
-	filp->f_op = &vmlogrdr_fops;
 
 	/* start recording for this service*/
 	if (logptr->autorecording) {
@@ -761,7 +760,7 @@ static int vmlogrdr_register_device(struct vmlogrdr_priv_t *priv)
 
 	dev = kzalloc(sizeof(struct device), GFP_KERNEL);
 	if (dev) {
-		dev_set_name(dev, priv->internal_name);
+		dev_set_name(dev, "%s", priv->internal_name);
 		dev->bus = &iucv_bus;
 		dev->parent = iucv_root;
 		dev->driver = &vmlogrdr_driver;
@@ -873,7 +872,7 @@ static int __init vmlogrdr_init(void)
 		goto cleanup;
 
 	for (i=0; i < MAXMINOR; ++i ) {
-		sys_ser[i].buffer = (char *) get_zeroed_page(GFP_KERNEL);
+		sys_ser[i].buffer = (char *) get_zeroed_page(GFP_KERNEL | GFP_DMA);
 		if (!sys_ser[i].buffer) {
 			rc = -ENOMEM;
 			break;

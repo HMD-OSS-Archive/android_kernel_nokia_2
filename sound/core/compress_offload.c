@@ -44,7 +44,12 @@
 #include <sound/compress_offload.h>
 #include <sound/compress_driver.h>
 
-#define U32_MAX ((u32)~0U)
+/* struct snd_compr_codec_caps overflows the ioctl bit size for some
+ * architectures, so we need to disable the relevant ioctls.
+ */
+#if _IOC_SIZEBITS < 14
+#define COMPR_CODEC_CAPS_OVERFLOW
+#endif
 
 /* TODO:
  * - add substream support for multiple devices in case of
@@ -147,8 +152,7 @@ static int snd_compr_free(struct inode *inode, struct file *f)
 	case SNDRV_PCM_STATE_RUNNING:
 	case SNDRV_PCM_STATE_DRAINING:
 	case SNDRV_PCM_STATE_PAUSED:
-		data->stream.ops->trigger(&data->stream,
-					SNDRV_PCM_TRIGGER_STOP);
+		data->stream.ops->trigger(&data->stream, SNDRV_PCM_TRIGGER_STOP);
 		break;
 	default:
 		break;
@@ -170,7 +174,7 @@ static int snd_compr_update_tstamp(struct snd_compr_stream *stream,
 	err = stream->ops->pointer(stream, tstamp);
 	if (err)
 		return err;
-	pr_debug("dsp consumed till %d total %d bytes\n",
+	pr_debug("dsp consumed till %d total %llu bytes\n",
 		tstamp->byte_offset, tstamp->copied_total);
 	if (stream->direction == SND_COMPRESS_PLAYBACK)
 		stream->runtime->total_bytes_transferred = tstamp->copied_total;
@@ -390,8 +394,7 @@ static unsigned int snd_compr_poll(struct file *f, poll_table *wait)
 		return -EFAULT;
 
 	mutex_lock(&stream->device->lock);
-	if (stream->runtime->state == SNDRV_PCM_STATE_PAUSED ||
-			stream->runtime->state == SNDRV_PCM_STATE_OPEN) {
+	if (stream->runtime->state == SNDRV_PCM_STATE_OPEN) {
 		retval = -EBADFD;
 		goto out;
 	}
@@ -445,6 +448,7 @@ out:
 	return retval;
 }
 
+#ifndef COMPR_CODEC_CAPS_OVERFLOW
 static int
 snd_compr_get_codec_caps(struct snd_compr_stream *stream, unsigned long arg)
 {
@@ -468,6 +472,7 @@ out:
 	kfree(caps);
 	return retval;
 }
+#endif /* !COMPR_CODEC_CAPS_OVERFLOW */
 
 /* revisit this with snd_pcm_preallocate_xxx */
 static int snd_compr_allocate_buffer(struct snd_compr_stream *stream,
@@ -498,7 +503,7 @@ static int snd_compress_check_input(struct snd_compr_params *params)
 {
 	/* first let's check the buffer parameter's */
 	if (params->buffer.fragment_size == 0 ||
-			params->buffer.fragments > U32_MAX / params->buffer.fragment_size)
+	    params->buffer.fragments > U32_MAX / params->buffer.fragment_size)
 		return -EINVAL;
 
 	/* now codec parameters */
@@ -506,9 +511,6 @@ static int snd_compress_check_input(struct snd_compr_params *params)
 		return -EINVAL;
 
 	if (params->codec.ch_in == 0 || params->codec.ch_out == 0)
-		return -EINVAL;
-
-	if (!(params->codec.sample_rate & SNDRV_PCM_RATE_8000_192000))
 		return -EINVAL;
 
 	return 0;
@@ -716,6 +718,7 @@ static int snd_compr_drain(struct snd_compr_stream *stream)
 		stream->runtime->state = SNDRV_PCM_STATE_DRAINING;
 		wake_up(&stream->runtime->sleep);
 	}
+
 ret:
 	mutex_unlock(&stream->device->lock);
 	return retval;
@@ -780,9 +783,7 @@ static int snd_compr_set_next_track_param(struct snd_compr_stream *stream,
 		return -EFAULT;
 
 	retval = stream->ops->set_next_track_param(stream, &codec_options);
-	if (retval != 0)
-		return retval;
-	return 0;
+	return retval;
 }
 
 static int snd_compress_simple_ioctls(struct file *file,
@@ -801,10 +802,11 @@ static int snd_compress_simple_ioctls(struct file *file,
 		retval = snd_compr_get_caps(stream, arg);
 		break;
 
+#ifndef COMPR_CODEC_CAPS_OVERFLOW
 	case _IOC_NR(SNDRV_COMPRESS_GET_CODEC_CAPS):
 		retval = snd_compr_get_codec_caps(stream, arg);
 		break;
-
+#endif
 
 	case _IOC_NR(SNDRV_COMPRESS_TSTAMP):
 		retval = snd_compr_tstamp(stream, arg);

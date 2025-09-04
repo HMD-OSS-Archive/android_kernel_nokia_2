@@ -1,17 +1,16 @@
 /*
-   Pstore feature is used to replace last_kmsg feature since kernel 3.10.
+  FIH pstore memory setting
 */
 
-#include "skeleton64.dtsi"
+/* ref: msm8937.dtsi */
 
-/{
-	memory {
-		pstore_reserve_mem: pstore_reserve_mem_region@0 {
-		linux,reserve-contiguous-region;
-		linux,reserve-region;
-		linux,remove-completely;
-		reg = <0x0 0x8E300000 0x0 0x00100000>;
-		label = "pstore_reserve_mem";
-		};
-	};
+/ {
+        reserved-memory {
+                pstore_reserve_mem: pstore_reserve_mem_region@0 {
+                        compatible = "removed-dma-pool";
+                        no-map;
+                        reg = <0 0x8E300000 0 0x00100000>;
+                        //label = "pstore_reserve_mem";
+                };
+        };
 };
